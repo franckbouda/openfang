@@ -63,6 +63,8 @@ pub enum ModelTier {
     Balanced,
     /// Fastest, cheapest models for simple tasks.
     Fast,
+    /// Audio transcription models (e.g. Whisper).
+    Audio,
     /// Local models (Ollama, vLLM, LM Studio).
     Local,
     /// User-defined custom models added at runtime.
@@ -76,6 +78,7 @@ impl fmt::Display for ModelTier {
             ModelTier::Smart => write!(f, "smart"),
             ModelTier::Balanced => write!(f, "balanced"),
             ModelTier::Fast => write!(f, "fast"),
+            ModelTier::Audio => write!(f, "audio"),
             ModelTier::Local => write!(f, "local"),
             ModelTier::Custom => write!(f, "custom"),
         }
@@ -197,6 +200,7 @@ mod tests {
         assert_eq!(ModelTier::Smart.to_string(), "smart");
         assert_eq!(ModelTier::Balanced.to_string(), "balanced");
         assert_eq!(ModelTier::Fast.to_string(), "fast");
+        assert_eq!(ModelTier::Audio.to_string(), "audio");
         assert_eq!(ModelTier::Local.to_string(), "local");
         assert_eq!(ModelTier::Custom.to_string(), "custom");
     }
