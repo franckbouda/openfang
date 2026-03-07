@@ -148,12 +148,13 @@ impl SemanticStore {
                     .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
                 sql.push_str(&format!(" AND source = ?{param_idx}"));
                 params.push(Box::new(source_str));
-                let _ = param_idx;
+                param_idx += 1;
             }
         }
 
         sql.push_str(" ORDER BY accessed_at DESC, access_count DESC");
-        sql.push_str(&format!(" LIMIT {fetch_limit}"));
+        sql.push_str(&format!(" LIMIT ?{param_idx}"));
+        params.push(Box::new(fetch_limit as i64));
 
         let mut stmt = conn
             .prepare(&sql)
@@ -552,5 +553,29 @@ mod tests {
         assert_eq!(results.len(), 2);
         // Embedded memory should rank first
         assert_eq!(results[0].content, "Has embedding");
+    }
+
+    #[test]
+    fn test_recall_limit_is_respected() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        // Insérer 5 mémoires
+        for i in 0..5 {
+            store
+                .remember(
+                    agent_id,
+                    &format!("Memory {i}"),
+                    MemorySource::Conversation,
+                    "episodic",
+                    HashMap::new(),
+                )
+                .unwrap();
+        }
+        // Demander seulement 2
+        let results = store.recall("Memory", 2, None).unwrap();
+        assert_eq!(results.len(), 2);
+        // Demander 10 (plus que disponible)
+        let results = store.recall("Memory", 10, None).unwrap();
+        assert_eq!(results.len(), 5);
     }
 }
