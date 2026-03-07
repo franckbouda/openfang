@@ -429,7 +429,10 @@ impl LlmDriver for GeminiDriver {
             }
 
             if !resp.status().is_success() {
-                let body = resp.text().await.unwrap_or_default();
+                let body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("(failed to read response: {e})"));
                 let message = serde_json::from_str::<GeminiErrorResponse>(&body)
                     .map(|e| e.error.message)
                     .unwrap_or(body);
@@ -512,7 +515,10 @@ impl LlmDriver for GeminiDriver {
             }
 
             if !resp.status().is_success() {
-                let body = resp.text().await.unwrap_or_default();
+                let body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("(failed to read response: {e})"));
                 let message = serde_json::from_str::<GeminiErrorResponse>(&body)
                     .map(|e| e.error.message)
                     .unwrap_or(body);
