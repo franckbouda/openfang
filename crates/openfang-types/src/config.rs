@@ -990,6 +990,10 @@ pub struct KernelConfig {
     /// Configure in config.toml as `[[fallback_providers]]`.
     #[serde(default)]
     pub fallback_providers: Vec<FallbackProviderConfig>,
+    /// Multiple Claude Code CLI accounts for automatic rotation when usage limits are hit.
+    /// Configure as `[[claude_code_accounts]]` in config.toml.
+    #[serde(default)]
+    pub claude_code_accounts: Vec<ClaudeCodeAccountConfig>,
     /// Browser automation configuration.
     #[serde(default)]
     pub browser: BrowserConfig,
@@ -1208,6 +1212,7 @@ impl Default for KernelConfig {
             usage_footer: UsageFooterMode::default(),
             web: WebConfig::default(),
             fallback_providers: Vec::new(),
+            claude_code_accounts: Vec::new(),
             browser: BrowserConfig::default(),
             extensions: ExtensionsConfig::default(),
             vault: VaultConfig::default(),
@@ -1280,6 +1285,10 @@ impl std::fmt::Debug for KernelConfig {
                 "fallback_providers",
                 &format!("{} provider(s)", self.fallback_providers.len()),
             )
+            .field(
+                "claude_code_accounts",
+                &format!("{} account(s)", self.claude_code_accounts.len()),
+            )
             .field("browser", &self.browser)
             .field("extensions", &self.extensions)
             .field("vault", &format!("enabled={}", self.vault.enabled))
@@ -1338,6 +1347,31 @@ fn openfang_home_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join(".openfang")
+}
+
+/// Configuration for a single Claude Code CLI account (multi-account rotation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClaudeCodeAccountConfig {
+    /// Path to the Claude config directory for this account (e.g., `~/.claude_work`).
+    /// Injected as `CLAUDE_CONFIG_DIR=<config_dir>` when spawning the CLI.
+    pub config_dir: String,
+    /// Human-readable label for logging.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Override CLI binary path (defaults to "claude" on PATH).
+    #[serde(default)]
+    pub cli_path: Option<String>,
+}
+
+impl Default for ClaudeCodeAccountConfig {
+    fn default() -> Self {
+        Self {
+            config_dir: "~/.claude".to_string(),
+            label: None,
+            cli_path: None,
+        }
+    }
 }
 
 /// Default LLM model configuration.
