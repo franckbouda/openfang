@@ -11,6 +11,8 @@ function chatPage() {
     messageQueue: [],    // Queue for messages sent while streaming
     thinkingMode: 'off', // 'off' | 'on' | 'stream'
     _wsAgent: null,
+    _wsReconnectMsg: null,   // Non-null when actively reconnecting (shows status to user)
+    _draftRestored: false,   // True when a draft was restored from localStorage
     showSlashMenu: false,
     slashFilter: '',
     slashIdx: 0,
@@ -100,6 +102,24 @@ function chatPage() {
       return short.length > 24 ? short.substring(0, 22) + '\u2026' : short;
     },
 
+    /// Compact badge label: "provider · model-name" for display under the chat header.
+    get modelBadgeLabel() {
+      if (!this.currentAgent) return '';
+      var provider = this.currentAgent.model_provider || '';
+      var name = this.currentAgent.model_name || '';
+      // Strip date suffix from model names (e.g. claude-3-5-sonnet-20241022 → claude-3-5-sonnet)
+      var shortName = name.replace(/-\d{8}$/, '');
+      if (shortName.length > 28) shortName = shortName.substring(0, 26) + '\u2026';
+      if (provider && shortName) return provider + ' \u00b7 ' + shortName;
+      return shortName || provider;
+    },
+
+    /// Model tier indicator (free/pro/premium) if present.
+    get modelTierLabel() {
+      if (!this.currentAgent) return '';
+      return this.currentAgent.model_tier || '';
+    },
+
     get switcherProviders() {
       var seen = {};
       (this._modelCache || []).forEach(function(m) { seen[m.provider] = true; });
@@ -187,6 +207,9 @@ function chatPage() {
 
       // Watch for slash commands + model autocomplete
       this.$watch('inputText', function(val) {
+        // Auto-save draft to localStorage on every keystroke
+        self.saveDraft();
+
         var modelMatch = val.match(/^\/model\s+(.*)$/i);
         if (modelMatch) {
           self.showSlashMenu = false;
@@ -502,6 +525,9 @@ function chatPage() {
         });
         localStorage.setItem('of-chat-tips-seen', 'true');
       }
+      // Restore any saved draft for this agent
+      this.restoreDraft();
+
       // Focus input after agent selection
       var self = this;
       this.$nextTick(function() {
@@ -522,12 +548,16 @@ function chatPage() {
             text = self.sanitizeToolText(text);
             // Build tool cards from historical tool data
             var tools = (m.tools || []).map(function(t, idx) {
+              // input may arrive as a JSON object (from serde) or a string (from WS events)
+              var inputStr = t.input
+                ? (typeof t.input === 'string' ? t.input : JSON.stringify(t.input))
+                : '';
               return {
                 id: (t.name || 'tool') + '-hist-' + idx,
                 name: t.name || 'unknown',
                 running: false,
-                expanded: false,
-                input: t.input || '',
+                expanded: true,
+                input: inputStr,
                 result: t.result || '',
                 is_error: !!t.is_error
               };
@@ -593,15 +623,22 @@ function chatPage() {
       OpenFangAPI.wsConnect(agentId, {
         onOpen: function() {
           Alpine.store('app').wsConnected = true;
+          // Clear any reconnecting status message
+          self._wsReconnectMsg = null;
         },
         onMessage: function(data) { self.handleWsMessage(data); },
         onClose: function() {
           Alpine.store('app').wsConnected = false;
           self._wsAgent = null;
+          self._wsReconnectMsg = null;
         },
         onError: function() {
           Alpine.store('app').wsConnected = false;
           self._wsAgent = null;
+        },
+        onReconnecting: function(attempt, maxAttempts, delaySecs) {
+          // Display reconnect status so the user sees the connection is recovering
+          self._wsReconnectMsg = 'Reconnecting (' + attempt + '/' + maxAttempts + ') in ' + delaySecs + 's\u2026';
         }
       });
     },
@@ -870,6 +907,46 @@ function chatPage() {
       return h + ':' + (m < 10 ? '0' : '') + m + ' ' + ampm;
     },
 
+    // ── Draft auto-save ──────────────────────────────────────────────────
+    // Persists the input text to localStorage per agent so users don't lose
+    // their work on refresh or accidental page close.
+
+    _draftKey: function() {
+      return this.currentAgent ? 'openfang_draft_' + this.currentAgent.id : null;
+    },
+
+    saveDraft: function() {
+      var key = this._draftKey();
+      if (!key) return;
+      if (this.inputText) {
+        localStorage.setItem(key, this.inputText);
+      } else {
+        localStorage.removeItem(key);
+      }
+    },
+
+    restoreDraft: function() {
+      var key = this._draftKey();
+      if (!key) return;
+      var saved = localStorage.getItem(key);
+      if (saved) {
+        this.inputText = saved;
+        this._draftRestored = true;
+        // Auto-hide the "Draft restored" badge after 4 seconds
+        var self = this;
+        setTimeout(function() { self._draftRestored = false; }, 4000);
+      } else {
+        this.inputText = '';
+        this._draftRestored = false;
+      }
+    },
+
+    clearDraft: function() {
+      var key = this._draftKey();
+      if (key) localStorage.removeItem(key);
+      this._draftRestored = false;
+    },
+
     // Copy message text to clipboard
     copyMessage: function(msg) {
       var text = msg.text || '';
@@ -902,6 +979,8 @@ function chatPage() {
       }
 
       this.inputText = '';
+      // Clear saved draft since the message is now being sent
+      this.clearDraft();
 
       // Reset textarea height to single line
       var ta = document.getElementById('msg-input');
@@ -1100,8 +1179,10 @@ function chatPage() {
 
     formatToolJson: function(text) {
       if (!text) return '';
-      try { return JSON.stringify(JSON.parse(text), null, 2); }
-      catch(e) { return text; }
+      try {
+        var obj = typeof text === 'string' ? JSON.parse(text) : text;
+        return JSON.stringify(obj, null, 2);
+      } catch(e) { return typeof text === 'string' ? text : JSON.stringify(text); }
     },
 
     // Voice: start recording

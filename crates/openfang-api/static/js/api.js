@@ -192,14 +192,23 @@ var OpenFangAPI = (function() {
   function patch(path, body) { return request('PATCH', path, body); }
   function del(path) { return request('DELETE', path); }
 
-  // WebSocket manager with auto-reconnect
+  // WebSocket manager with exponential backoff auto-reconnect
   var _ws = null;
   var _wsCallbacks = {};
   var _wsConnected = false;
   var _wsAgentId = null;
   var _reconnectTimer = null;
   var _reconnectAttempts = 0;
-  var MAX_RECONNECT = 5;
+  // Reconnect config: initial 1s, 2x factor, max 16s, +random jitter up to 1s, max 10 tries
+  var MAX_RECONNECT = 10;
+  var WS_RECONNECT_BASE_MS = 1000;
+  var WS_RECONNECT_MAX_MS = 16000;
+
+  function _reconnectDelay(attempt) {
+    var base = Math.min(WS_RECONNECT_BASE_MS * Math.pow(2, attempt - 1), WS_RECONNECT_MAX_MS);
+    var jitter = Math.random() * 1000;
+    return Math.round(base + jitter);
+  }
 
   function wsConnect(agentId, callbacks) {
     wsDisconnect();
@@ -217,11 +226,11 @@ var OpenFangAPI = (function() {
 
       _ws.onopen = function() {
         _wsConnected = true;
+        var wasReconnecting = _reconnectAttempts > 0;
         _reconnectAttempts = 0;
         setConnectionState('connected');
-        if (_reconnectAttempt > 0) {
+        if (wasReconnecting) {
           OpenFangToast.success('Reconnected');
-          _reconnectAttempt = 0;
         }
         if (_wsCallbacks.onOpen) _wsCallbacks.onOpen();
       };
@@ -238,18 +247,23 @@ var OpenFangAPI = (function() {
         _ws = null;
         if (_wsAgentId && _reconnectAttempts < MAX_RECONNECT && e.code !== 1000) {
           _reconnectAttempts++;
-          _reconnectAttempt = _reconnectAttempts;
           setConnectionState('reconnecting');
+          var delay = _reconnectDelay(_reconnectAttempts);
           if (_reconnectAttempts === 1) {
             OpenFangToast.warn('Connection lost, reconnecting...');
+          } else {
+            // Update user on reconnect progress
+            var secs = Math.round(delay / 1000);
+            if (_wsCallbacks.onReconnecting) {
+              _wsCallbacks.onReconnecting(_reconnectAttempts, MAX_RECONNECT, secs);
+            }
           }
-          var delay = Math.min(1000 * Math.pow(2, _reconnectAttempts - 1), 10000);
           _reconnectTimer = setTimeout(function() { _doConnect(_wsAgentId); }, delay);
           return;
         }
         if (_wsAgentId && _reconnectAttempts >= MAX_RECONNECT) {
           setConnectionState('disconnected');
-          OpenFangToast.error('Connection lost — switched to HTTP mode', 0);
+          OpenFangToast.error('Connection lost after ' + MAX_RECONNECT + ' retries — switched to HTTP mode', 0);
         }
         if (_wsCallbacks.onClose) _wsCallbacks.onClose();
       };
