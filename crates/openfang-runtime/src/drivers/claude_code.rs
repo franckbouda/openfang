@@ -24,20 +24,27 @@ impl ClaudeCodeDriver {
     ///
     /// `cli_path` overrides the CLI binary path; defaults to `"claude"` on PATH.
     pub fn new(cli_path: Option<String>) -> Self {
+        let raw = cli_path
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "claude".to_string());
         Self {
-            cli_path: cli_path
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "claude".to_string()),
+            cli_path: resolve_claude_path(&raw),
             config_dir: None,
         }
     }
 
+    /// Return the resolved CLI path (useful for status/detection display).
+    pub fn cli_path(&self) -> &str {
+        &self.cli_path
+    }
+
     /// Create a driver with a specific config directory (for multi-account rotation).
     pub fn new_with_config(cli_path: Option<String>, config_dir: Option<String>) -> Self {
+        let raw = cli_path
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "claude".to_string());
         Self {
-            cli_path: cli_path
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "claude".to_string()),
+            cli_path: resolve_claude_path(&raw),
             config_dir: config_dir.filter(|s| !s.is_empty()),
         }
     }
@@ -133,6 +140,81 @@ struct ClaudeStreamEvent {
     result: Option<String>,
     #[serde(default)]
     usage: Option<ClaudeUsage>,
+}
+
+/// Resolve the full path to the `claude` binary.
+///
+/// GUI apps (Tauri, Electron) have a limited PATH (`/usr/bin:/bin:/usr/sbin:/sbin`)
+/// that does not include user-level npm/homebrew installations. This function
+/// checks common installation paths so the binary can be found regardless of PATH.
+fn resolve_claude_path(path: &str) -> String {
+    // If user specified a custom path (not the default "claude"), use it as-is.
+    if path != "claude" {
+        return expand_tilde(path);
+    }
+
+    let home = {
+        #[cfg(not(target_os = "windows"))]
+        { std::env::var("HOME").unwrap_or_default() }
+        #[cfg(target_os = "windows")]
+        { std::env::var("USERPROFILE").unwrap_or_default() }
+    };
+
+    // Check common installation locations in order of likelihood.
+    let candidates: &[&str] = &[
+        // npm install -g (default prefix on Linux/macOS without nvm)
+        // covered by dynamic path below
+    ];
+    // Dynamic candidates that need $HOME interpolation
+    let dynamic: Vec<String> = if home.is_empty() {
+        vec![]
+    } else {
+        vec![
+            format!("{}/.local/bin/claude", home),        // npm --prefix ~/.local
+            format!("{}/.npm-global/bin/claude", home),   // npm --prefix ~/.npm-global
+            format!("{}/.yarn/bin/claude", home),          // yarn global
+        ]
+    };
+    let static_paths: &[&str] = &[
+        "/opt/homebrew/bin/claude",   // Homebrew (Apple Silicon)
+        "/usr/local/bin/claude",       // Homebrew (Intel) / npm global
+        "/usr/bin/claude",
+    ];
+
+    for c in candidates {
+        if std::path::Path::new(c).exists() {
+            return c.to_string();
+        }
+    }
+    for c in &dynamic {
+        if std::path::Path::new(c.as_str()).exists() {
+            return c.clone();
+        }
+    }
+    for c in static_paths {
+        if std::path::Path::new(c).exists() {
+            return c.to_string();
+        }
+    }
+
+    // Try NVM: scan ~/.nvm/versions/node/*/bin/claude
+    if !home.is_empty() {
+        let nvm_base = std::path::PathBuf::from(&home).join(".nvm/versions/node");
+        if let Ok(entries) = std::fs::read_dir(&nvm_base) {
+            let mut versions: Vec<_> = entries.flatten().collect();
+            // Sort descending so latest version is tried first
+            versions.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
+            for entry in versions {
+                let candidate = entry.path().join("bin/claude");
+                if candidate.exists() {
+                    return candidate.to_string_lossy().to_string();
+                }
+            }
+        }
+    }
+
+    // Fallback: rely on whatever is in PATH (may fail in GUI context)
+    path.to_string()
 }
 
 /// Expand `~/` to the actual home directory.

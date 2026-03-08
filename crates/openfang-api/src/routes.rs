@@ -5517,18 +5517,42 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
         // For local providers, add reachability info via health probe
         if !p.key_required {
             entry["is_local"] = serde_json::json!(true);
-            let probe = openfang_runtime::provider_health::probe_provider(&p.id, &p.base_url).await;
-            entry["reachable"] = serde_json::json!(probe.reachable);
-            entry["latency_ms"] = serde_json::json!(probe.latency_ms);
-            if !probe.discovered_models.is_empty() {
-                entry["discovered_models"] = serde_json::json!(probe.discovered_models);
-                // Merge discovered models into the catalog so agents can use them
-                if let Ok(mut catalog) = state.kernel.model_catalog.write() {
-                    catalog.merge_discovered_models(&p.id, &probe.discovered_models);
+
+            // Claude Code CLI: detect binary instead of HTTP probe
+            if p.id == "claude-code" {
+                let cli_path = openfang_runtime::drivers::claude_code::ClaudeCodeDriver::new(None).cli_path().to_string();
+                let detected = std::path::Path::new(&cli_path).exists()
+                    || cli_path != "claude";
+                entry["cli_detected"] = serde_json::json!(detected);
+                entry["cli_path"] = serde_json::json!(cli_path);
+                // Version info (non-blocking best-effort)
+                if detected {
+                    let version = std::process::Command::new(&cli_path)
+                        .arg("--version")
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+                    if let Some(v) = version {
+                        entry["cli_version"] = serde_json::json!(v);
+                    }
                 }
-            }
-            if let Some(err) = &probe.error {
-                entry["error"] = serde_json::json!(err);
+            } else {
+                let probe = openfang_runtime::provider_health::probe_provider(&p.id, &p.base_url).await;
+                entry["reachable"] = serde_json::json!(probe.reachable);
+                entry["latency_ms"] = serde_json::json!(probe.latency_ms);
+                if !probe.discovered_models.is_empty() {
+                    entry["discovered_models"] = serde_json::json!(probe.discovered_models);
+                    // Merge discovered models into the catalog so agents can use them
+                    if let Ok(mut catalog) = state.kernel.model_catalog.write() {
+                        catalog.merge_discovered_models(&p.id, &probe.discovered_models);
+                    }
+                }
+                if let Some(err) = &probe.error {
+                    entry["error"] = serde_json::json!(err);
+                }
             }
         }
 

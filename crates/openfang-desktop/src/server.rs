@@ -43,12 +43,66 @@ impl Drop for ServerHandle {
     }
 }
 
+/// Enrich the process PATH so subprocesses (e.g. `claude` CLI) can be found
+/// in GUI apps that inherit a minimal PATH from launchd.
+fn enrich_path() {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut extra: Vec<String> = Vec::new();
+
+    // User-local binaries (npm --prefix ~/.local, pipx, cargo, etc.)
+    if !home.is_empty() {
+        let candidates = [
+            format!("{home}/.local/bin"),
+            format!("{home}/.npm-global/bin"),
+            format!("{home}/.yarn/bin"),
+            format!("{home}/.cargo/bin"),
+        ];
+        for c in &candidates {
+            if std::path::Path::new(c).exists() {
+                extra.push(c.clone());
+            }
+        }
+
+        // NVM: add the latest installed node version's bin
+        let nvm_base = std::path::PathBuf::from(&home).join(".nvm/versions/node");
+        if let Ok(entries) = std::fs::read_dir(&nvm_base) {
+            let mut versions: Vec<_> = entries.flatten().collect();
+            versions.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
+            if let Some(latest) = versions.first() {
+                let bin = latest.path().join("bin");
+                if bin.exists() {
+                    extra.push(bin.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    // System package managers
+    for p in &["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"] {
+        if std::path::Path::new(p).exists() {
+            extra.push(p.to_string());
+        }
+    }
+
+    if extra.is_empty() {
+        return;
+    }
+
+    let current = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", extra.join(":"), current);
+    std::env::set_var("PATH", &new_path);
+    info!("Enriched PATH with {} extra directories", extra.len());
+}
+
 /// Boot the kernel and start the embedded API server on a background thread.
 ///
 /// Binds to `127.0.0.1:0` on the calling thread so the port is known before
 /// any Tauri window is created. The actual axum server runs on a dedicated
 /// thread with its own tokio runtime.
 pub fn start_server() -> Result<ServerHandle, Box<dyn std::error::Error>> {
+    // Enrich PATH for GUI app context (launchd has minimal PATH)
+    enrich_path();
+
     // Auto-initialize vault and migrate config.toml secrets
     let home = openfang_kernel::config::openfang_home();
     let vault_path = home.join("vault.enc");

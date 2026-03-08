@@ -3008,12 +3008,23 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                       </div>
                     </div>
                   </template>
-                  <!-- Claude Code install hint -->
-                  <template x-if="p.id === 'claude-code' && p.auth_status !== 'configured'">
-                    <div class="mt-2 text-xs text-dim">Install: <code style="color:var(--accent-light);background:var(--bg);padding:1px 4px;border-radius:2px">npm install -g @anthropic-ai/claude-code</code></div>
+                  <!-- Claude Code: detection status -->
+                  <template x-if="p.id === 'claude-code'">
+                    <div class="mt-3" style="border-top:1px solid var(--border);padding-top:8px">
+                      <div class="flex items-center gap-2 mb-1">
+                        <span class="text-xs" :style="p.cli_detected ? 'color:var(--success)' : 'color:var(--error)'">
+                          <span x-text="p.cli_detected ? '● CLI detected' : '● CLI not found'"></span>
+                        </span>
+                        <span class="text-xs text-dim" x-show="p.cli_version" x-text="'v' + p.cli_version"></span>
+                      </div>
+                      <div x-show="p.cli_detected" class="text-xs text-dim truncate" style="font-family:var(--font-mono);font-size:10px" x-text="p.cli_path"></div>
+                      <div x-show="!p.cli_detected" class="mt-1 text-xs text-dim">
+                        Install: <code style="color:var(--accent-light);background:var(--bg);padding:1px 4px;border-radius:2px">npm install -g @anthropic-ai/claude-code</code>
+                      </div>
+                    </div>
                   </template>
                   <!-- Actions for configured providers -->
-                  <template x-if="p.auth_status === 'configured'">
+                  <template x-if="p.auth_status === 'configured' && p.id !== 'claude-code'">
                     <div class="flex gap-2 mt-2">
                       <button class="btn btn-ghost btn-sm" @click="testProvider(p)" :disabled="providerTesting[p.id]">
                         <span x-show="!providerTesting[p.id]">Test</span>
@@ -3024,10 +3035,10 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                   </template>
                   <!-- No key needed -->
                   <template x-if="!p.api_key_env || p.key_required === false">
-                    <div class="text-xs mt-2" style="color:var(--success)" x-show="p.auth_status !== 'configured' && p.auth_status !== 'not_set' && p.auth_status !== 'missing'">No API key needed &mdash; runs locally or is free</div>
+                    <div class="text-xs mt-2" style="color:var(--success)" x-show="p.auth_status !== 'configured' && p.auth_status !== 'not_set' && p.auth_status !== 'missing' && p.id !== 'claude-code'">No API key needed &mdash; runs locally or is free</div>
                   </template>
-                  <!-- Base URL editor for local providers -->
-                  <template x-if="p.is_local">
+                  <!-- Base URL editor for local providers (not claude-code — it's a CLI, not HTTP) -->
+                  <template x-if="p.is_local && p.id !== 'claude-code'">
                     <div class="mt-3" style="border-top:1px solid var(--border);padding-top:8px">
                       <div class="text-xs text-dim mb-1">Base URL</div>
                       <div class="key-input-group">
