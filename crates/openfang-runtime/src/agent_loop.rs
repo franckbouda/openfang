@@ -220,6 +220,10 @@ pub async fn run_agent_loop(
 
     // Add the user message to session history
     session.messages.push(Message::user(user_message));
+    // Persist immediately so the message survives navigation away during generation
+    if let Err(e) = memory.save_session(session) {
+        warn!("Failed to pre-save user message to session: {e}");
+    }
 
     // Build the messages for the LLM, filtering system messages
     // System prompt goes into the separate `system` field
@@ -1125,6 +1129,10 @@ pub async fn run_agent_loop_streaming(
 
     // Add the user message to session history
     session.messages.push(Message::user(user_message));
+    // Persist immediately so the message survives navigation away during generation
+    if let Err(e) = memory.save_session(session) {
+        warn!("Failed to pre-save user message to session: {e}");
+    }
 
     let llm_messages: Vec<Message> = session
         .messages
