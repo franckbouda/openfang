@@ -70,13 +70,25 @@ pub async fn gcra_rate_limit(
             .status(StatusCode::TOO_MANY_REQUESTS)
             .header("content-type", "application/json")
             .header("retry-after", "60")
+            .header("RateLimit-Limit", "500")
+            .header("RateLimit-Remaining", "0")
+            .header("RateLimit-Reset", "60")
             .body(Body::from(
                 serde_json::json!({"error": "Rate limit exceeded"}).to_string(),
             ))
             .unwrap_or_default();
     }
 
-    next.run(request).await
+    let mut response = next.run(request).await;
+    // Inject standard rate limit headers on successful responses
+    let headers = response.headers_mut();
+    if let Ok(v) = "500".parse() {
+        headers.insert("RateLimit-Limit", v);
+    }
+    if let Ok(v) = "60".parse() {
+        headers.insert("RateLimit-Reset", v);
+    }
+    response
 }
 
 #[cfg(test)]
