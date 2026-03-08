@@ -43,6 +43,7 @@ pub fn run() {
     // Boot kernel + embedded server (blocks until port is known)
     let server_handle = server::start_server().expect("Failed to start OpenFang server");
     let port = server_handle.port;
+    let vault_display_key = server_handle.vault_display_key.clone();
     let kernel_for_notifications = server_handle.kernel.clone();
 
     info!("OpenFang server running on port {port}");
@@ -105,6 +106,19 @@ pub fn run() {
             commands::open_logs_dir,
         ])
         .setup(move |app| {
+            // Show vault master key dialog if newly created
+            if let Some(ref key) = vault_display_key {
+                use tauri_plugin_dialog::DialogExt;
+                let msg = format!(
+                    "Le vault OpenFang vient d'être créé.\n\nSauvegarde cette clé maître dans un endroit sûr :\n\n{}\n\nPour restaurer l'accès sur une nouvelle machine :\nOPENFANG_VAULT_KEY=<clé>",
+                    key
+                );
+                app.dialog()
+                    .message(msg)
+                    .title("Clé Vault — À Sauvegarder !")
+                    .blocking_show();
+            }
+
             // Create the main window pointing directly at the embedded HTTP server.
             // We do NOT define windows in tauri.conf.json because Tauri would try to
             // load index.html from embedded assets (which don't exist), causing a race
