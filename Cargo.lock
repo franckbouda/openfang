@@ -3976,6 +3976,7 @@ dependencies = [
  "axum",
  "open",
  "openfang-api",
+ "openfang-extensions",
  "openfang-kernel",
  "openfang-types",
  "serde",
