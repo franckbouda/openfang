@@ -96,3 +96,53 @@ pub struct ClawHubInstallRequest {
     /// ClawHub skill slug (e.g., "github-helper").
     pub slug: String,
 }
+
+/// Unified error response for all API error cases.
+///
+/// Use this struct to return structured, machine-readable errors to API clients.
+/// Fields:
+/// - `error`: Human-readable error message.
+/// - `error_code`: Optional short code for the error category (e.g. "rate_limit", "billing").
+/// - `retryable`: Whether the client can retry the request (e.g. after a delay).
+/// - `details`: Optional additional context (arbitrary JSON).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ErrorResponse {
+    pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+impl ErrorResponse {
+    /// Create a simple non-retryable error with no code.
+    pub fn simple(msg: impl Into<String>) -> Self {
+        Self {
+            error: msg.into(),
+            error_code: None,
+            retryable: false,
+            details: None,
+        }
+    }
+
+    /// Create an error with a short error code.
+    pub fn with_code(msg: impl Into<String>, code: impl Into<String>) -> Self {
+        Self {
+            error: msg.into(),
+            error_code: Some(code.into()),
+            retryable: false,
+            details: None,
+        }
+    }
+
+    /// Create a retryable error (e.g. rate limit).
+    pub fn retryable(msg: impl Into<String>) -> Self {
+        Self {
+            error: msg.into(),
+            error_code: None,
+            retryable: true,
+            details: None,
+        }
+    }
+}
