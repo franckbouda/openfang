@@ -125,6 +125,31 @@ pub fn validate_and_repair_with_stats(messages: &[Message]) -> (Vec<Message>, Re
     let dedup_count = deduplicate_tool_results(&mut cleaned);
     stats.duplicates_removed = dedup_count;
 
+    // Phase 2e-pre: Truncate oversized ToolResult content (>512KB).
+    //
+    // Prevents sending multi-megabyte tool outputs to the LLM API, which can
+    // cause request failures or excessive token costs.
+    const MAX_TOOL_RESULT_BYTES: usize = 512 * 1024; // 512 KB
+    for msg in cleaned.iter_mut() {
+        if let MessageContent::Blocks(blocks) = &mut msg.content {
+            for block in blocks.iter_mut() {
+                if let ContentBlock::ToolResult { content, .. } = block {
+                    if content.len() > MAX_TOOL_RESULT_BYTES {
+                        let safe = crate::str_utils::safe_truncate_str(content, MAX_TOOL_RESULT_BYTES);
+                        *content = format!(
+                            "{}\n[Content truncated: exceeded 512KB limit]",
+                            safe
+                        );
+                        warn!(
+                            original_len = content.len(),
+                            "Truncated oversized ToolResult content to 512KB"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // Phase 2e: Skip aborted/errored assistant messages
     // An assistant message with no content blocks (or only empty text) followed by
     // a user message containing ToolResults indicates an interrupted tool-use.
@@ -162,6 +187,33 @@ pub fn validate_and_repair_with_stats(messages: &[Message]) -> (Vec<Message>, Re
         );
     }
 
+    // Phase 3b: Verify strict role alternation after merge.
+    //
+    // The merge loop should already prevent consecutive same-role messages, but
+    // as a safety net (e.g. edge cases from earlier passes), do a final scan and
+    // merge any remaining adjacent same-role messages.
+    let mut alternation_fixed = 0usize;
+    let mut final_messages: Vec<Message> = Vec::with_capacity(merged.len());
+    for msg in merged {
+        if let Some(last) = final_messages.last_mut() {
+            if last.role == msg.role {
+                // This should not happen after the merge pass, but handle it defensively
+                warn!(
+                    role = ?last.role,
+                    "Post-merge alternation violation detected — merging"
+                );
+                merge_content(&mut last.content, msg.content);
+                alternation_fixed += 1;
+                stats.messages_merged += 1;
+                continue;
+            }
+        }
+        final_messages.push(msg);
+    }
+    if alternation_fixed > 0 {
+        debug!(count = alternation_fixed, "Fixed post-merge alternation violations");
+    }
+
     if stats != RepairStats::default() {
         warn!(
             orphaned = stats.orphaned_results_removed,
@@ -174,7 +226,7 @@ pub fn validate_and_repair_with_stats(messages: &[Message]) -> (Vec<Message>, Re
         );
     }
 
-    (merged, stats)
+    (final_messages, stats)
 }
 
 /// Phase 2b: Reorder misplaced ToolResults -- ensure each result follows its use.
@@ -340,15 +392,25 @@ fn insert_synthetic_results(messages: &mut Vec<Message>) -> usize {
         })
         .collect();
 
-    // Find ToolUse blocks without matching results
-    let mut orphaned_uses: Vec<(usize, String)> = Vec::new(); // (assistant_msg_idx, tool_use_id)
+    // Find ToolUse blocks without matching results; collect their input for the synthetic error.
+    // Tuple: (assistant_msg_idx, tool_use_id, tool_name, input_summary)
+    let mut orphaned_uses: Vec<(usize, String, String, String)> = Vec::new();
     for (idx, msg) in messages.iter().enumerate() {
         if msg.role == Role::Assistant {
             if let MessageContent::Blocks(blocks) = &msg.content {
                 for block in blocks {
-                    if let ContentBlock::ToolUse { id, .. } = block {
+                    if let ContentBlock::ToolUse { id, name, input } = block {
                         if !existing_result_ids.contains(id) {
-                            orphaned_uses.push((idx, id.clone()));
+                            // Summarise the input so the LLM knows what was being called
+                            let input_str = serde_json::to_string(input)
+                                .unwrap_or_default();
+                            // Truncate long inputs to keep the synthetic message small
+                            let input_summary = if input_str.len() > 200 {
+                                format!("{}…", &input_str[..200])
+                            } else {
+                                input_str
+                            };
+                            orphaned_uses.push((idx, id.clone(), name.clone(), input_summary));
                         }
                     }
                 }
@@ -364,14 +426,22 @@ fn insert_synthetic_results(messages: &mut Vec<Message>) -> usize {
 
     // Group by assistant message index
     let mut grouped: HashMap<usize, Vec<ContentBlock>> = HashMap::new();
-    for (idx, tool_use_id) in orphaned_uses {
+    for (idx, tool_use_id, tool_name, input_summary) in orphaned_uses {
+        let content = if input_summary.is_empty() || input_summary == "{}" {
+            "[Tool execution was interrupted or lost]".to_string()
+        } else {
+            format!(
+                "[Tool execution was interrupted or lost. Called with: {}]",
+                input_summary
+            )
+        };
         grouped
             .entry(idx)
             .or_default()
             .push(ContentBlock::ToolResult {
                 tool_use_id,
-                tool_name: String::new(),
-                content: "[Tool execution was interrupted or lost]".to_string(),
+                tool_name,
+                content,
                 is_error: true,
             });
     }
