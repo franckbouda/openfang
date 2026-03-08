@@ -1398,6 +1398,52 @@ fn cmd_start(config: Option<PathBuf>) {
     println!("  Starting daemon...");
     ui::blank();
 
+    // Auto-initialize vault if it doesn't exist
+    let vault_path = cli_openfang_home().join("vault.enc");
+    if !vault_path.exists() {
+        let mut vault = openfang_extensions::vault::CredentialVault::new(vault_path.clone());
+        match vault.init_and_get_display_key() {
+            Ok(Some(key_b64)) => {
+                ui::success("Credential vault created automatically");
+                ui::blank();
+                println!("  ┌─────────────────────────────────────────────────────────────────┐");
+                println!("  │  VAULT MASTER KEY — Sauvegarde dans un endroit sûr !            │");
+                println!("  │                                                                 │");
+                println!("  │  {:<63}│", key_b64.as_str());
+                println!("  │                                                                 │");
+                println!("  │  Pour restaurer: OPENFANG_VAULT_KEY=<key>                       │");
+                println!("  └─────────────────────────────────────────────────────────────────┘");
+                ui::blank();
+            }
+            Ok(None) => {
+                ui::success("Credential vault created (clé depuis le keyring OS)");
+            }
+            Err(e) => ui::hint(&format!("Could not init vault: {e}")),
+        }
+    }
+
+    // Migrate raw secrets from config.toml to vault
+    let config_path = cli_openfang_home().join("config.toml");
+    if vault_path.exists() && config_path.exists() {
+        let mut vault = openfang_extensions::vault::CredentialVault::new(vault_path.clone());
+        if vault.unlock().is_ok() {
+            match openfang_extensions::credentials::migrate_config_to_vault(
+                &config_path,
+                &mut vault,
+            ) {
+                Ok(migrated) if !migrated.is_empty() => {
+                    ui::success(&format!(
+                        "{} credential(s) migrated from config.toml to vault: {}",
+                        migrated.len(),
+                        migrated.join(", ")
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => ui::hint(&format!("Migration config.toml→vault skipped: {e}")),
+            }
+        }
+    }
+
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let kernel = match OpenFangKernel::boot(config.as_deref()) {
@@ -2019,18 +2065,14 @@ fn cmd_doctor(json: bool, repair: bool) {
                             ui::check_ok(".env file (permissions fixed to 0600)");
                         }
                         repaired = true;
-                    } else {
-                        if !json {
-                            ui::check_warn(&format!(
-                                ".env file has loose permissions ({:o}), should be 0600",
-                                mode
-                            ));
-                        }
+                    } else if !json {
+                        ui::check_warn(&format!(
+                            ".env file has loose permissions ({:o}), should be 0600",
+                            mode
+                        ));
                     }
-                } else {
-                    if !json {
-                        ui::check_ok(".env file");
-                    }
+                } else if !json {
+                    ui::check_ok(".env file");
                 }
             }
             #[cfg(not(unix))]
