@@ -678,12 +678,14 @@ async fn handle_text_message(
                                 }),
                             )
                             .await;
-                            let user_msg = classify_streaming_error(&e);
+                            let err_info = classify_streaming_error(&e);
                             let _ = send_json(
                                 sender,
                                 &serde_json::json!({
                                     "type": "error",
-                                    "content": user_msg,
+                                    "content": err_info.content,
+                                    "retryable": err_info.retryable,
+                                    "error_code": err_info.error_code,
                                 }),
                             )
                             .await;
@@ -718,12 +720,14 @@ async fn handle_text_message(
                         }),
                     )
                     .await;
-                    let user_msg = classify_streaming_error(&e);
+                    let err_info = classify_streaming_error(&e);
                     let _ = send_json(
                         sender,
                         &serde_json::json!({
                             "type": "error",
-                            "content": user_msg,
+                            "content": err_info.content,
+                            "retryable": err_info.retryable,
+                            "error_code": err_info.error_code,
                         }),
                     )
                     .await;
@@ -1082,19 +1086,34 @@ fn sanitize_text(s: &str) -> String {
         .to_string()
 }
 
-/// Classify a streaming/setup error into a user-friendly message.
+/// Structured error classification result for WebSocket error messages.
+struct WsErrorInfo {
+    content: String,
+    retryable: bool,
+    error_code: &'static str,
+}
+
+/// Classify a streaming/setup error into a structured WS error message.
 ///
-/// Uses the proper LLM error classifier from `openfang_runtime::llm_errors`
-/// for comprehensive 20-provider coverage with actionable advice.
-fn classify_streaming_error(err: &openfang_kernel::error::KernelError) -> String {
+/// Returns content, retryability flag, and error code for the client so it can
+/// display actionable feedback and decide whether to offer a retry button.
+fn classify_streaming_error(err: &openfang_kernel::error::KernelError) -> WsErrorInfo {
     let inner = format!("{err}");
 
     // Check for agent-specific errors first (not LLM errors)
     if inner.contains("Agent not found") {
-        return "Agent not found. It may have been stopped or deleted.".to_string();
+        return WsErrorInfo {
+            content: "Agent not found. It may have been stopped or deleted.".to_string(),
+            retryable: false,
+            error_code: "agent_not_found",
+        };
     }
     if inner.contains("quota") || inner.contains("Quota") {
-        return "Token quota exceeded. Try /compact or /new to free up space.".to_string();
+        return WsErrorInfo {
+            content: "Token quota exceeded. Try /compact or /new to free up space.".to_string(),
+            retryable: false,
+            error_code: "quota_exceeded",
+        };
     }
 
     // Use the LLM error classifier for everything else
@@ -1102,32 +1121,56 @@ fn classify_streaming_error(err: &openfang_kernel::error::KernelError) -> String
     let classified = llm_errors::classify_error(&inner, status);
 
     match classified.category {
-        llm_errors::LlmErrorCategory::ContextOverflow => {
-            "Context is full. Try /compact or /new.".to_string()
-        }
+        llm_errors::LlmErrorCategory::ContextOverflow => WsErrorInfo {
+            content: "Context is full. Try /compact or /new.".to_string(),
+            retryable: false,
+            error_code: "context_overflow",
+        },
         llm_errors::LlmErrorCategory::RateLimit => {
-            if let Some(delay_ms) = classified.suggested_delay_ms {
+            let content = if let Some(delay_ms) = classified.suggested_delay_ms {
                 let secs = (delay_ms / 1000).max(1);
                 format!("Provider rate limited. Wait ~{secs}s and try again.")
             } else {
                 "Provider rate limited. Wait a moment and try again.".to_string()
+            };
+            WsErrorInfo {
+                content,
+                retryable: true,
+                error_code: "rate_limit",
             }
         }
-        llm_errors::LlmErrorCategory::Billing => {
-            "Check provider account status (billing issue detected).".to_string()
-        }
-        llm_errors::LlmErrorCategory::Auth => "Verify your API key in config.".to_string(),
+        llm_errors::LlmErrorCategory::Billing => WsErrorInfo {
+            content: "Check provider account status (billing issue detected).".to_string(),
+            retryable: false,
+            error_code: "billing",
+        },
+        llm_errors::LlmErrorCategory::Auth => WsErrorInfo {
+            content: "Verify your API key in config.".to_string(),
+            retryable: false,
+            error_code: "auth",
+        },
         llm_errors::LlmErrorCategory::ModelNotFound => {
-            if inner.contains("localhost:11434") || inner.contains("ollama") {
+            let content = if inner.contains("localhost:11434") || inner.contains("ollama") {
                 "Model not found on Ollama. Run `ollama pull <model>` to download it, then try again. Use /model to see options.".to_string()
             } else {
                 "Model unavailable. Use /model to see options or check your provider configuration.".to_string()
+            };
+            WsErrorInfo {
+                content,
+                retryable: false,
+                error_code: "model_not_found",
             }
         }
-        llm_errors::LlmErrorCategory::Format => {
-            "LLM request failed. Check your API key and model configuration in Settings.".to_string()
-        }
-        _ => classified.sanitized_message,
+        llm_errors::LlmErrorCategory::Format => WsErrorInfo {
+            content: "LLM request failed. Check your API key and model configuration in Settings.".to_string(),
+            retryable: false,
+            error_code: "format",
+        },
+        _ => WsErrorInfo {
+            content: classified.sanitized_message,
+            retryable: true,
+            error_code: "network",
+        },
     }
 }
 
