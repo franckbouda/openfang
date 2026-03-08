@@ -781,6 +781,98 @@ mark.search-highlight {
   margin-bottom: 4px;
 }
 
+/* ── Tool Timeline ─────────────────────────────────────────── */
+.tool-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 4px 0 8px 0;
+  padding: 6px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-md);
+  animation: slideUp 0.2s var(--ease-smooth);
+}
+
+.tool-timeline-step {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  animation: slideUp 0.15s var(--ease-smooth);
+}
+
+.tool-timeline-step.tl-error { color: var(--error); }
+
+.tl-spinner {
+  width: 11px;
+  height: 11px;
+  border: 1.5px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+.tl-ok {
+  color: var(--success);
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+  width: 11px;
+  text-align: center;
+}
+
+.tl-err {
+  color: var(--error);
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+  width: 11px;
+  text-align: center;
+}
+
+.tl-icon {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  opacity: 0.55;
+}
+
+.tl-name {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--text);
+  font-size: 11px;
+  flex-shrink: 0;
+  min-width: 110px;
+}
+
+.tl-arg {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Category accent colors for timeline border */
+.tool-timeline:has([data-tool^="file_"]),
+.tool-timeline:has([data-tool^="directory_"]) { border-left-color: #60A5FA; }
+.tool-timeline:has([data-tool^="web_"]),
+.tool-timeline:has([data-tool^="link_"]) { border-left-color: #34D399; }
+.tool-timeline:has([data-tool^="shell"]),
+.tool-timeline:has([data-tool^="exec_"]) { border-left-color: #FBBF24; }
+.tool-timeline:has([data-tool^="agent_"]) { border-left-color: #A78BFA; }
+.tool-timeline:has([data-tool^="memory_"]),
+.tool-timeline:has([data-tool^="knowledge_"]) { border-left-color: #F472B6; }
+.tool-timeline:has([data-tool^="browser_"]) { border-left-color: #2DD4BF; }
+
 .tool-pre {
   margin: 0;
   padding: 6px 10px;
