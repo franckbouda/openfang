@@ -1,29 +1,27 @@
-# Feature à implémenter : Kernel lit le vault pour les API keys
+# OpenFang — Bug Tracker
 
-## Problème actuel
+> Dernière vérification : 2026-03-08
 
-Le champ `api_key_env` dans `config.toml` contient un **nom de variable d'environnement** :
-```toml
-api_key_env = "GROQ_API_KEY"
-```
+---
 
-Le kernel résout cette valeur uniquement via `std::env::var("GROQ_API_KEY")`. Après migration vers le vault, la clé est dans `~/.openfang/vault.enc` mais **pas dans les env vars système** → le kernel ne trouve pas la clé → fallback sur les defaults.
+## Bugs critiques
 
-## Solution à implémenter
+### BUG-001 — Vault → Env Injection manquante
+**Sévérité** : HIGH
+**Statut** : 🔴 PRÉSENT
+**Fichiers** : `crates/openfang-kernel/src/kernel.rs:552`, `crates/openfang-runtime/src/drivers/mod.rs`
 
-### Étape 1 (simple) — Injecter le vault dans le process env au boot
+Le kernel résout `api_key_env` uniquement via `std::env::var()`. Les clés chiffrées dans `vault.enc` ne sont jamais injectées dans les drivers LLM → les clés stockées dans le vault sont ignorées silencieusement.
 
-Dans `OpenFangKernel::boot()` (probablement dans `crates/openfang-kernel/src/lib.rs`), après le chargement du config, injecter les valeurs du vault comme env vars temporaires :
+**Solution — Étape 1 (rapide)** : Injecter le vault dans les env vars du process au boot dans `OpenFangKernel::boot()` :
 
 ```rust
-// Inject vault credentials into process env so api_key_env fields resolve correctly
 let vault_path = openfang_home().join("vault.enc");
 if vault_path.exists() {
     let mut vault = openfang_extensions::vault::CredentialVault::new(vault_path);
     if vault.unlock().is_ok() {
         for key in vault.list_keys() {
             if std::env::var(key).is_err() {
-                // Only inject if not already set in env (don't override real env vars)
                 if let Some(val) = vault.get(key) {
                     std::env::set_var(key, val.as_str());
                 }
@@ -33,130 +31,181 @@ if vault_path.exists() {
 }
 ```
 
-### Étape 2 (propre) — Modifier les drivers LLM pour utiliser CredentialResolver
+**Solution — Étape 2 (propre)** : Modifier les drivers pour passer par `CredentialResolver` (`crates/openfang-extensions/src/credentials.rs`) au lieu de `std::env::var`.
 
-Modifier la résolution de `api_key_env` dans chaque driver pour passer par `CredentialResolver` au lieu de `std::env::var` directement. Plus sécurisé (valeurs restent dans le vault), mais plus de travail.
-
-## Fichiers clés à modifier
+**Fichiers à modifier** :
 
 | Fichier | Rôle |
 |---------|------|
 | `crates/openfang-kernel/src/lib.rs` | `OpenFangKernel::boot()` — injecter vault avant le boot des agents |
-| `crates/openfang-runtime/src/drivers/openai.rs` | Résolution `api_key_env` → ajouter fallback vault |
+| `crates/openfang-runtime/src/drivers/openai.rs` | Résolution `api_key_env` → fallback vault |
 | `crates/openfang-runtime/src/drivers/anthropic.rs` | Idem |
 | `crates/openfang-runtime/src/drivers/gemini.rs` | Idem |
-| `crates/openfang-extensions/src/credentials.rs` | `CredentialResolver` — déjà capable de lire le vault |
-
-## Dépendance à ajouter
-
-`openfang-kernel` devra dépendre de `openfang-extensions` dans son `Cargo.toml` :
-```toml
-openfang-extensions = { path = "../openfang-extensions" }
-```
-Vérifier qu'il n'y a pas de dépendance circulaire (kernel ← runtime ← extensions est OK car extensions ne dépend pas de kernel).
-
-## Approche recommandée
-
-Commencer par l'Étape 1 pour un fix rapide, puis refactorer vers l'Étape 2 si la sécurité est une priorité.
 
 ---
 
-# Bug : Modèle par défaut introuvable + absence de notification d'erreur à l'utilisateur
+### BUG-002 — Modèle par défaut cassé
+**Sévérité** : HIGH
+**Statut** : ✅ CORRIGÉ
+**Fichier** : `crates/openfang-types/src/config.rs`
 
-## Symptôme
-
-Après installation, envoyer un message à l'agent par défaut produit silencieusement :
-```
-WARN agent_loop: LLM stream error: The requested model was not found. model=gpt-oss-120b
-WARN kernel: Streaming agent loop failed error=LLM driver error: The requested model was not found.
-WARN api::ws: Agent message failed: LLM driver error: The requested model was not found.
-```
-L'utilisateur ne voit aucune notification dans l'UI — le message disparaît sans réponse ni alerte.
-
-## Cause #1 — Mauvais nom de modèle par défaut
-
-Le config.toml d'exemple utilise `model = "gpt-oss-120b"` avec `provider = "groq"`. Groq exige le préfixe `openai/` pour ces modèles :
-
-```
-gpt-oss-120b       ← invalide pour Groq
-openai/gpt-oss-120b ← correct
-```
-
-**Fix** : Corriger le modèle par défaut dans le template `config.toml` (généré par `openfang init` ou l'init wizard) et dans le `KernelConfig::default()` :
-
-- Fichier : `crates/openfang-types/src/config.rs` → `impl Default for ModelConfig`
-- Fichier : `crates/openfang-cli/src/tui/screens/init_wizard.rs` → modèle Groq proposé par défaut
-- Le modèle correct à utiliser : `"llama-3.3-70b-versatile"` (stable, gratuit, bien supporté)
-
-## Cause #2 — Absence de notification utilisateur en cas d'erreur LLM
-
-Quand l'agent loop échoue (`Streaming agent loop failed`), le WebSocket reçoit un `AgentMessageFailed` mais **aucun message d'erreur n'est envoyé dans le chat** côté UI. L'utilisateur voit juste le message partir sans réponse.
-
-**Fix** : Dans `crates/openfang-api/src/routes.rs` (handler WebSocket/SSE), quand `agent_loop` retourne une erreur, envoyer un message d'erreur explicite au client :
-
-```rust
-Err(e) => {
-    // Envoyer l'erreur comme message de l'assistant dans le chat
-    let error_msg = format!("⚠️ Erreur : {}", e);
-    // ws_send(AgentMessage { role: "error", content: error_msg })
-    warn!("Agent message failed: {e}");
-}
-```
-
-Ou alternativement, émettre un événement SSE/WS de type `error` que le frontend Alpine.js affiche comme toast ou message dans le chat.
-
-## Fichiers à modifier
-
-| Fichier | Changement |
-|---------|-----------|
-| `crates/openfang-types/src/config.rs` | `ModelConfig::default()` → `model = "llama-3.3-70b-versatile"` |
-| `crates/openfang-cli/src/tui/screens/init_wizard.rs` | Modèle Groq par défaut proposé |
-| `crates/openfang-api/src/routes.rs` | Handler WS/SSE → envoyer message d'erreur au client si agent loop échoue |
-| `crates/openfang-api/static/js/` | Frontend → afficher les messages d'erreur reçus |
+Le modèle par défaut est maintenant `claude-sonnet-4-20250514` avec provider `anthropic`. L'ancien `gpt-oss-120b` avec provider `groq` (qui nécessitait le préfixe `openai/`) n'est plus le défaut.
 
 ---
 
-# Bug : La clé maître du vault ne s'affiche pas à la création
+### BUG-003 — Vault master key jamais affichée à la création
+**Sévérité** : MEDIUM
+**Statut** : ✅ CORRIGÉ
+**Fichier** : `crates/openfang-extensions/src/vault.rs`, `crates/openfang-cli/src/main.rs`
 
-## Problème
+La fonction `init_and_get_display_key()` retourne maintenant la clé lors de la création. La CLI affiche la clé dans un encadré avec le message "VAULT MASTER KEY — Sauvegarde dans un endroit sûr !".
 
-La méthode `init_and_get_display_key()` dans `crates/openfang-extensions/src/vault.rs` retourne `Some(key)` **uniquement si** la clé a été nouvellement générée ET que le keyring OS n'était pas disponible. Sur macOS, le keyring (fichier `~/.local/share/openfang/.keyring`) réussit toujours → la méthode retourne `None` → le banner avec la clé ne s'affiche jamais dans le CLI ni dans le desktop.
+> Note : Vérifier que sur macOS (keyring toujours accessible) `Some(key)` est bien retourné même quand le keyring réussit.
 
-L'utilisateur n'a donc aucun moyen de sauvegarder la clé maître pour restaurer le vault sur une autre machine.
+---
 
-## Comportement actuel
+## Sécurité
 
-```
-init_and_get_display_key()
-  ├─ env var OPENFANG_VAULT_KEY présente → None (clé existante)
-  ├─ keyring OS accessible           → None (clé existante)  ← toujours le cas sur macOS
-  └─ keyring inaccessible            → Some(key) ← n'arrive jamais en pratique
-```
+### BUG-004 — SQL Injection via LIMIT
+**Sévérité** : CRITIQUE
+**Statut** : ✅ CORRIGÉ
+**Fichier** : `crates/openfang-memory/src/semantic.rs:156`
 
-## Solution à implémenter
+`LIMIT` est maintenant passé via un paramètre bindé (`?{param_idx}`) et non via `format!()`.
 
-Toujours retourner `Some(key)` quand le vault est **nouvellement créé**, peu importe si le keyring a réussi ou non. L'utilisateur doit pouvoir sauvegarder la clé même si elle est déjà dans le keyring (le keyring peut être perdu, corrompu, ou la machine peut changer).
+---
 
-Dans `vault.rs`, modifier `init_and_get_display_key()` :
+### BUG-005 — Timing attack sur la comparaison de clé API
+**Sévérité** : MEDIUM
+**Statut** : 🟡 PARTIEL
+**Fichier** : `crates/openfang-api/src/middleware.rs:131`
 
+La comparaison finale utilise `subtle::ConstantTimeEq` (correct), mais un early return sur la longueur (`if token.len() != api_key.len() { return false; }`) expose la longueur de la clé via timing side-channel.
+
+**Correction attendue** : Remplacer l'early return longueur par une comparaison sur des buffers de taille fixe (HMAC-SHA256 des deux valeurs, puis `ct_eq`).
+
+---
+
+### BUG-006 — Endpoints sensibles sans authentification
+**Sévérité** : HIGH
+**Statut** : ✅ CORRIGÉ (par design)
+**Fichier** : `crates/openfang-api/src/middleware.rs`
+
+`/api/agents`, `/api/budget`, `/api/providers` sont intentionnellement publics pour permettre au dashboard SPA de se rendre avant l'authentification. Comportement documenté et voulu.
+
+---
+
+### BUG-007 — Prometheus exposé sans auth
+**Sévérité** : MEDIUM
+**Statut** : ✅ CORRIGÉ
+**Fichier** : `crates/openfang-api/src/server.rs`
+
+`/api/metrics` est protégé par authentification et n'est plus dans la liste des endpoints publics.
+
+---
+
+### BUG-008 — Upload sans TTL (accumulation disque)
+**Sévérité** : MEDIUM
+**Statut** : 🔴 PRÉSENT
+**Fichier** : `crates/openfang-api/src/routes.rs:8547`
+
+Les fichiers uploadés sont stockés dans `temp_dir()/openfang_uploads/`. Le `UPLOAD_REGISTRY` (`DashMap<String, UploadMeta>`) ne contient pas de timestamp ni de TTL. Les fichiers s'accumulent indéfiniment → vecteur de DoS par remplissage disque.
+
+**Correction attendue** : Ajouter `uploaded_at: Instant` dans `UploadMeta`, lancer une tâche de nettoyage toutes les heures qui supprime les fichiers de plus de 24h.
+
+---
+
+## Performance & Robustesse
+
+### BUG-009 — Instances `reqwest::Client::new()` multiples dans les drivers
+**Sévérité** : MEDIUM
+**Statut** : 🔴 PRÉSENT
+**Fichiers** : `crates/openfang-runtime/src/drivers/openai.rs:28`, `anthropic.rs`, `gemini.rs`
+
+Chaque instance de driver LLM crée un nouveau `reqwest::Client` sans configuration (`ClientBuilder`). En production, cela génère des dizaines de connection pools séparés, gaspillant mémoire et descripteurs de fichiers.
+
+**Correction attendue** : Client partagé via `once_cell::Lazy<reqwest::Client>` ou injecté depuis le kernel.
+
+---
+
+### BUG-010 — Memory leak dans `running_tasks`
+**Sévérité** : HIGH
+**Statut** : ✅ CORRIGÉ
+**Fichier** : `crates/openfang-kernel/src/kernel.rs:2728`
+
+Les `AbortHandle` sont correctement supprimés du `DashMap` lors de l'arrêt des agents. Pas de fuite mémoire.
+
+---
+
+### BUG-011 — HTTP clients sans timeout dans les drivers LLM
+**Sévérité** : MEDIUM
+**Statut** : 🔴 PRÉSENT
+**Fichiers** : `crates/openfang-runtime/src/drivers/openai.rs`, `anthropic.rs`, `gemini.rs`
+
+`reqwest::Client::new()` sans `ClientBuilder::timeout()`. Un appel LLM suspendu (provider down) peut bloquer indéfiniment.
+
+**Correction attendue** :
 ```rust
-// Toujours retourner la clé display si c'est une nouvelle initialisation
-// (que la clé vienne du keyring ou soit nouvellement générée)
-let display_key = Some(Zeroizing::new(base64::Engine::encode(
-    &base64::engine::general_purpose::STANDARD,
-    key_bytes.as_ref(),
-)));
+reqwest::ClientBuilder::new()
+    .timeout(Duration::from_secs(120))
+    .connect_timeout(Duration::from_secs(10))
+    .build()?
 ```
 
-Supprimer le flag `newly_generated` et toujours retourner `Some(key)`.
+---
 
-## Fichiers à modifier
+### BUG-012 — Zombie streaming (agent continue si client déconnecté)
+**Sévérité** : MEDIUM
+**Statut** : ✅ CORRIGÉ
+**Fichier** : `crates/openfang-runtime/src/agent_loop.rs`
 
-| Fichier | Changement |
-|---------|-----------|
-| `crates/openfang-extensions/src/vault.rs` | `init_and_get_display_key()` → toujours retourner `Some(key)` |
+Quand `stream_tx.send(...).is_err()`, un warning est logué et l'agent arrête d'envoyer des événements stream. L'exécution continue en arrière-plan (comportement attendu).
 
-## Impact
+---
 
-- CLI (`openfang start`) : le banner avec la clé s'affichera systématiquement à la première création du vault
-- Desktop (`cargo tauri dev`) : le dialog Tauri s'affichera systématiquement à la première création du vault
+## Features IDEE.md
+
+### BUG-013 — ClawHub 429 backoff manquant
+**Sévérité** : LOW
+**Statut** : 🔴 PRÉSENT (TODO documenté dans `IDEE.md:6`)
+
+```
+WARN openfang_api::routes: ClawHub install failed: Network error:
+ClawHub download returned 429 Too Many Requests
+```
+
+Aucun retry avec backoff exponentiel dans le driver ClawHub. L'installation d'extensions échoue silencieusement sur rate limit.
+
+**Correction attendue** : Retry avec backoff (1s → 2s → 4s, max 3 tentatives) + message d'erreur explicite dans l'UI.
+
+---
+
+### BUG-014 — Groq Whisper models
+**Sévérité** : -
+**Statut** : ✅ IMPLÉMENTÉ
+**Fichiers** : `crates/openfang-runtime/src/media_understanding.rs`, `crates/openfang-runtime/src/model_catalog.rs`
+
+`whisper-large-v3` et `whisper-large-v3-turbo` (alias : `whisper-turbo`) sont enregistrés dans le catalogue et fonctionnels avec fallback vers OpenAI Whisper.
+
+---
+
+## Résumé
+
+| ID | Description | Sévérité | Statut |
+|----|-------------|----------|--------|
+| BUG-001 | Vault → Env injection manquante | HIGH | 🔴 À corriger |
+| BUG-002 | Modèle par défaut cassé | HIGH | ✅ Corrigé |
+| BUG-003 | Vault master key jamais affichée | MEDIUM | ✅ Corrigé |
+| BUG-004 | SQL Injection via LIMIT | CRITIQUE | ✅ Corrigé |
+| BUG-005 | Timing attack longueur clé API | MEDIUM | 🟡 Partiel |
+| BUG-006 | Endpoints sans auth | HIGH | ✅ Corrigé |
+| BUG-007 | Prometheus exposé sans auth | MEDIUM | ✅ Corrigé |
+| BUG-008 | Upload sans TTL | MEDIUM | 🔴 À corriger |
+| BUG-009 | reqwest::Client::new() multiples | MEDIUM | 🔴 À corriger |
+| BUG-010 | Memory leak running_tasks | HIGH | ✅ Corrigé |
+| BUG-011 | HTTP clients sans timeout | MEDIUM | 🔴 À corriger |
+| BUG-012 | Zombie streaming | MEDIUM | ✅ Corrigé |
+| BUG-013 | ClawHub 429 backoff | LOW | 🔴 À corriger |
+| BUG-014 | Groq Whisper models | — | ✅ Implémenté |
+
+**Priorité** : BUG-001 (vault injection) → BUG-005 (timing attack) → BUG-008 (upload TTL) → BUG-009 + BUG-011 (reqwest clients) → BUG-013 (ClawHub)
