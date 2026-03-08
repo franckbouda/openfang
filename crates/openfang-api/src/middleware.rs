@@ -203,6 +203,60 @@ pub async fn security_headers(request: Request<Body>, next: Next) -> Response<Bo
     response
 }
 
+/// Middleware: validate Content-Type for POST, PUT, and PATCH requests.
+///
+/// Ensures that requests with a non-empty body declare `Content-Type: application/json`.
+/// Returns 415 Unsupported Media Type if the header is missing or wrong.
+/// This protects handlers from accidentally parsing malformed bodies.
+pub async fn validate_content_type(request: Request<Body>, next: Next) -> Response<Body> {
+    let method = request.method().clone();
+    if matches!(
+        method,
+        axum::http::Method::POST | axum::http::Method::PUT | axum::http::Method::PATCH
+    ) {
+        let content_type = request
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        // Only enforce if there is actually a body (content-length > 0 or transfer-encoding set)
+        let has_body = request
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|len| len > 0)
+            .unwrap_or_else(|| {
+                // If no content-length, check transfer-encoding
+                request
+                    .headers()
+                    .contains_key(axum::http::header::TRANSFER_ENCODING)
+            });
+
+        if has_body && !content_type.starts_with("application/json") {
+            // Allow multipart/form-data and octet-stream for file upload endpoints
+            let path = request.uri().path().to_string();
+            let is_upload = path.contains("/upload") || path.contains("/uploads");
+            if !is_upload && !content_type.starts_with("multipart/") && !content_type.starts_with("application/octet-stream") {
+                return Response::builder()
+                    .status(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "error": "Content-Type must be application/json",
+                            "error_code": "unsupported_media_type"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap_or_default();
+            }
+        }
+    }
+
+    next.run(request).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
