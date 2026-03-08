@@ -10311,3 +10311,95 @@ pub async fn comms_task(
         ),
     }
 }
+
+/// GET /api/rate-limit/status — Return current rate limit configuration.
+///
+/// Returns the quota limit, window size, and per-operation costs so clients
+/// can display or enforce rate limit awareness without hitting a 429.
+pub async fn get_rate_limit_status(_state: State<Arc<AppState>>) -> impl IntoResponse {
+    use crate::rate_limiter::operation_cost;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "limit": 500,
+            "window_seconds": 60,
+            "costs": {
+                "health": operation_cost("GET", "/api/health").get(),
+                "list_agents": operation_cost("GET", "/api/agents").get(),
+                "spawn_agent": operation_cost("POST", "/api/agents").get(),
+                "send_message": operation_cost("POST", "/api/agents/x/message").get(),
+                "run_workflow": operation_cost("POST", "/api/workflows/x/run").get(),
+                "install_skill": operation_cost("POST", "/api/skills/install").get(),
+                "migrate": operation_cost("POST", "/api/migrate").get(),
+                "default": operation_cost("GET", "/api/unknown").get(),
+            }
+        })),
+    )
+}
+
+/// GET /api/providers/health — Return health status of all configured providers.
+///
+/// Probes each local/key-free provider and returns reachability, latency, and
+/// any error encountered. Cloud providers are listed as unchecked (require auth).
+pub async fn get_providers_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let provider_list: Vec<openfang_types::model_catalog::ProviderInfo> = {
+        let catalog = state
+            .kernel
+            .model_catalog
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        catalog.list_providers().to_vec()
+    };
+
+    let mut results: Vec<serde_json::Value> = Vec::with_capacity(provider_list.len());
+
+    for p in &provider_list {
+        if !p.key_required {
+            // Local provider — probe it
+            if p.id == "claude-code" {
+                let cli_path = openfang_runtime::drivers::claude_code::ClaudeCodeDriver::new(None).cli_path().to_string();
+                let detected = std::path::Path::new(&cli_path).exists();
+                let mut entry = serde_json::json!({
+                    "provider": p.id,
+                    "display_name": p.display_name,
+                    "status": if detected { "ok" } else { "unavailable" },
+                    "latency_ms": serde_json::Value::Null,
+                    "local": true,
+                });
+                if !detected {
+                    entry["error"] = serde_json::json!("claude CLI binary not found");
+                }
+                results.push(entry);
+            } else {
+                let probe = openfang_runtime::provider_health::probe_provider(&p.id, &p.base_url).await;
+                results.push(serde_json::json!({
+                    "provider": p.id,
+                    "display_name": p.display_name,
+                    "status": if probe.reachable { "ok" } else { "unreachable" },
+                    "latency_ms": probe.latency_ms,
+                    "error": probe.error,
+                    "local": true,
+                }));
+            }
+        } else {
+            // Cloud provider — report configured/unconfigured but don't probe
+            let has_key = p.auth_status == openfang_types::model_catalog::AuthStatus::Configured;
+            results.push(serde_json::json!({
+                "provider": p.id,
+                "display_name": p.display_name,
+                "status": if has_key { "configured" } else { "no_key" },
+                "latency_ms": null,
+                "error": null,
+                "local": false,
+            }));
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "providers": results,
+            "total": results.len(),
+        })),
+    )
+}
