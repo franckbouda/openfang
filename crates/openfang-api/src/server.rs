@@ -420,6 +420,16 @@ pub async fn build_router(
             "/api/comms/task",
             axum::routing::post(routes::comms_task),
         )
+        // Rate limit status endpoint
+        .route(
+            "/api/rate-limit/status",
+            axum::routing::get(routes::get_rate_limit_status),
+        )
+        // Provider health dashboard endpoint
+        .route(
+            "/api/providers/health",
+            axum::routing::get(routes::get_providers_health),
+        )
         // Tools endpoint
         .route("/api/tools", axum::routing::get(routes::list_tools))
         // Config endpoints
