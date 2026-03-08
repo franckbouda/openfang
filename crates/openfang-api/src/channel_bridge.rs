@@ -52,19 +52,85 @@ use openfang_channels::ntfy::NtfyAdapter;
 use openfang_channels::webhook::WebhookAdapter;
 use openfang_kernel::OpenFangKernel;
 use openfang_types::agent::AgentId;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
+
+// ---------------------------------------------------------------------------
+// Deduplication cache — prevents double-delivery on reconnect
+// ---------------------------------------------------------------------------
+
+/// In-memory cache for message deduplication.
+///
+/// Uses a hash of (agent_id, message_content) as key with a configurable TTL.
+/// This prevents the same message from being delivered twice if a channel
+/// adapter reconnects and replays recent events (30-second window).
+struct DedupeCache {
+    entries: HashMap<String, Instant>,
+    ttl: Duration,
+}
+
+impl DedupeCache {
+    fn new(ttl_secs: u64) -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl: Duration::from_secs(ttl_secs),
+        }
+    }
+
+    /// Returns `true` if this key was seen within the TTL window.
+    /// As a side effect, records the key if it is new.
+    fn is_duplicate(&mut self, key: &str) -> bool {
+        self.cleanup();
+        if self.entries.contains_key(key) {
+            return true;
+        }
+        self.entries.insert(key.to_string(), Instant::now());
+        false
+    }
+
+    /// Evict entries whose TTL has expired.
+    fn cleanup(&mut self) {
+        let ttl = self.ttl;
+        self.entries.retain(|_, inserted_at| inserted_at.elapsed() < ttl);
+    }
+}
+
+/// Compute a short dedupe key from agent_id and message content.
+fn dedupe_key(agent_id: AgentId, message: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    agent_id.hash(&mut h);
+    message.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
 
 /// Wraps `OpenFangKernel` to implement `ChannelBridgeHandle`.
 pub struct KernelBridgeAdapter {
     kernel: Arc<OpenFangKernel>,
     started_at: Instant,
+    /// Shared deduplication cache — 30-second TTL.
+    dedupe: Arc<Mutex<DedupeCache>>,
 }
 
 #[async_trait]
 impl ChannelBridgeHandle for KernelBridgeAdapter {
     async fn send_message(&self, agent_id: AgentId, message: &str) -> Result<String, String> {
+        // Deduplication: skip if this exact (agent, message) was seen recently
+        let key = dedupe_key(agent_id, message);
+        {
+            let mut cache = self.dedupe.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.is_duplicate(&key) {
+                warn!(
+                    agent_id = %agent_id,
+                    "Skipping duplicate channel message (dedupe hit)"
+                );
+                return Ok(String::new());
+            }
+        }
+
         let result = self
             .kernel
             .send_message(agent_id, message)
@@ -1014,9 +1080,13 @@ pub async fn start_channel_bridge_with_config(
         return (None, Vec::new());
     }
 
+    // Shared dedupe cache: 30-second TTL shared between all handle instances.
+    let shared_dedupe = Arc::new(Mutex::new(DedupeCache::new(30)));
+
     let handle = KernelBridgeAdapter {
         kernel: kernel.clone(),
         started_at: Instant::now(),
+        dedupe: Arc::clone(&shared_dedupe),
     };
 
     // Collect all adapters to start
@@ -1574,6 +1644,7 @@ pub async fn start_channel_bridge_with_config(
     let bridge_handle: Arc<dyn ChannelBridgeHandle> = Arc::new(KernelBridgeAdapter {
         kernel: kernel.clone(),
         started_at: Instant::now(),
+        dedupe: Arc::clone(&shared_dedupe),
     });
     let router = Arc::new(router);
     let mut manager = BridgeManager::new(bridge_handle, router);
