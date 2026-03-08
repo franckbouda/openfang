@@ -617,6 +617,24 @@
                         <div class="message-bubble" x-show="msg.thinking" style="background:transparent;border:none;padding:4px 0">
                           <div class="typing-dots"><span></span><span></span><span></span></div>
                         </div>
+                        <!-- Tool Timeline — compact step list shown above response -->
+                        <div x-show="msg.role === 'agent' && !msg.thinking" class="text-xs" style="color:orange;padding:2px 6px">
+                          [DEBUG] tools=<span x-text="(msg.tools||[]).length"></span> timeline=<span x-text="$store.app.timelineEnabled"></span>
+                        </div>
+                        <template x-if="msg.tools && msg.tools.length && $store.app.timelineEnabled && !msg.thinking">
+                          <div class="tool-timeline">
+                            <template x-for="step in msg.tools" :key="step.id">
+                              <div class="tool-timeline-step" :class="{ 'tl-error': step.is_error }" :data-tool="step.name">
+                                <template x-if="step.running"><div class="tl-spinner"></div></template>
+                                <template x-if="!step.running && !step.is_error"><span class="tl-ok">&#10003;</span></template>
+                                <template x-if="!step.running && step.is_error"><span class="tl-err">&#10007;</span></template>
+                                <span class="tl-icon" x-html="toolIcon(step.name)"></span>
+                                <span class="tl-name" x-text="step.name"></span>
+                                <span class="tl-arg" x-text="toolArgPreview(step)"></span>
+                              </div>
+                            </template>
+                          </div>
+                        </template>
                         <!-- Normal message content -->
                         <div class="message-bubble" :class="{ 'markdown-body': (msg.role === 'agent' || msg.role === 'system') && !msg.thinking && !msg.isHtml }" x-show="msg.text && msg.text.trim() && !msg.thinking" x-html="highlightSearch(msg.isHtml ? msg.text : ((msg.role === 'agent' || msg.role === 'system') && !msg.thinking ? renderMarkdown(msg.text) : escapeHtml(msg.text)))"></div>
                         <!-- Inline images from uploads (shown above tool cards) -->
@@ -2970,6 +2988,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             <div class="tab tab-secondary" role="tab" :class="{ active: tab === 'budget' }" @click="tab = 'budget'">Budget</div>
             <div class="tab tab-secondary" role="tab" :class="{ active: tab === 'info' }" @click="tab = 'info'">System</div>
             <div class="tab tab-secondary" role="tab" :class="{ active: tab === 'migration' }" @click="tab = 'migration'">Migration</div>
+            <div class="tab tab-secondary" role="tab" :class="{ active: tab === 'interface' }" @click="tab = 'interface'">Interface</div>
           </div>
 
           <!-- Providers tab -->
@@ -3677,6 +3696,23 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               <div class="flex gap-2 mt-4">
                 <button class="btn btn-primary" @click="migStep = 'manual'">Enter Path Manually</button>
                 <button class="btn btn-ghost" @click="migStep = 'intro'">Back</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Interface tab -->
+          <div x-show="tab === 'interface'">
+            <div class="info-card">
+              <h4>Chat Interface</h4>
+              <p>Customize the visual behaviour of the chat window.</p>
+            </div>
+            <div class="card" style="margin-bottom:12px">
+              <div style="display:flex;justify-content:space-between;align-items:center">
+                <div>
+                  <div style="font-weight:600;font-size:13px;margin-bottom:2px">Tool Timeline</div>
+                  <div class="card-meta">Show a compact step-by-step list of tool calls above the agent's response. Each line displays the tool name and its main argument.</div>
+                </div>
+                <div class="toggle" :class="{ active: $store.app.timelineEnabled }" @click="$store.app.toggleTimeline()" style="flex-shrink:0;margin-left:16px" title="Toggle tool timeline"></div>
               </div>
             </div>
           </div>

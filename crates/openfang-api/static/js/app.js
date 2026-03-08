@@ -102,12 +102,18 @@ document.addEventListener('alpine:init', function() {
     agentCount: 0,
     pendingAgent: null,
     focusMode: localStorage.getItem('openfang-focus') === 'true',
+    timelineEnabled: localStorage.getItem('of-timeline-enabled') !== 'false',
     showOnboarding: false,
     showAuthPrompt: false,
 
     toggleFocusMode() {
       this.focusMode = !this.focusMode;
       localStorage.setItem('openfang-focus', this.focusMode);
+    },
+
+    toggleTimeline() {
+      this.timelineEnabled = !this.timelineEnabled;
+      localStorage.setItem('of-timeline-enabled', this.timelineEnabled);
     },
 
     async refreshAgents() {

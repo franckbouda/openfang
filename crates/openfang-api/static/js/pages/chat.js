@@ -802,8 +802,8 @@ function chatPage() {
           var streamedText = '';
           var streamedTools = [];
           this.messages.forEach(function(m) {
-            if (m.streaming && !m.thinking && m.role === 'agent') {
-              streamedText += m.text || '';
+            if (m.streaming && m.role === 'agent') {
+              if (!m.thinking) streamedText += m.text || '';
               streamedTools = streamedTools.concat(m.tools || []);
             }
           });
@@ -1183,6 +1183,34 @@ function chatPage() {
         var obj = typeof text === 'string' ? JSON.parse(text) : text;
         return JSON.stringify(obj, null, 2);
       } catch(e) { return typeof text === 'string' ? text : JSON.stringify(text); }
+    },
+
+    // Extract the most meaningful argument from a tool input for timeline display
+    toolArgPreview: function(tool) {
+      if (!tool.input) return '';
+      try {
+        var input = typeof tool.input === 'string' ? JSON.parse(tool.input) : tool.input;
+        if (!input || typeof input !== 'object') return '';
+        var priority = ['path', 'file', 'command', 'query', 'url', 'pattern', 'content', 'message', 'name', 'text'];
+        for (var i = 0; i < priority.length; i++) {
+          var val = input[priority[i]];
+          if (val && typeof val === 'string' && val.trim()) {
+            if (priority[i] === 'path' || priority[i] === 'file') {
+              var parts = val.replace(/\\/g, '/').split('/').filter(Boolean);
+              if (parts.length > 2) val = '…/' + parts.slice(-2).join('/');
+            }
+            return val.length > 48 ? val.substring(0, 46) + '…' : val;
+          }
+        }
+        var keys = Object.keys(input);
+        for (var j = 0; j < keys.length; j++) {
+          var v = input[keys[j]];
+          if (typeof v === 'string' && v.trim()) {
+            return v.length > 48 ? v.substring(0, 46) + '…' : v;
+          }
+        }
+      } catch(e) {}
+      return '';
     },
 
     // Voice: start recording
