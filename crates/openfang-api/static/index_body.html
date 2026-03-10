@@ -4,7 +4,8 @@
 <div x-show="$store.app.showAuthPrompt" style="position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px)" x-data="{ apiKeyInput: '' }">
   <div style="background:var(--bg-card,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:2rem;max-width:400px;width:90%">
     <h3 style="margin:0 0 0.5rem;font-size:1.1rem">API Key Required</h3>
-    <p style="color:var(--text-dim,#888);font-size:0.85rem;margin:0 0 1rem">This instance requires an API key. Enter the key from your <code>config.toml</code>.</p>
+    <p style="color:var(--text-dim,#888);font-size:0.85rem;margin:0 0 0.5rem">This instance requires an API key. Enter the key from your <code>config.toml</code>.</p>
+    <p style="color:var(--text-dim,#666);font-size:0.75rem;margin:0 0 1rem">Add <code style="color:var(--accent-light,#a78bfa);background:var(--bg,#111);padding:1px 4px;border-radius:2px">api_key = "your-key"</code> at the <strong>top</strong> of <code>~/.openfang/config.toml</code> (not under any [section]).</p>
     <input type="password" x-model="apiKeyInput" placeholder="Enter API key..." @keydown.enter="$store.app.submitApiKey(apiKeyInput)" style="width:100%;padding:0.6rem;border-radius:6px;border:1px solid var(--border,#333);background:var(--bg-input,#151520);color:var(--text,#e0e0e0);font-size:0.9rem;box-sizing:border-box;margin-bottom:0.75rem">
     <button @click="$store.app.submitApiKey(apiKeyInput)" style="width:100%;padding:0.6rem;border-radius:6px;border:none;background:var(--accent,#7c3aed);color:#fff;font-weight:600;cursor:pointer;font-size:0.9rem">Unlock Dashboard</button>
   </div>
@@ -753,7 +754,7 @@
                   <span class="text-xs" style="color:var(--danger)" x-text="formatRecordingTime()"></span>
                 </div>
                 <textarea id="msg-input" rows="1" :placeholder="recording ? 'Recording... release to send' : 'Message OpenFang... (/ for commands)'"
-                          @keydown.enter.prevent="if(!$event.shiftKey){if(showModelPicker && filteredModelPicker.length){pickModel(filteredModelPicker[modelPickerIdx].id)}else if(showSlashMenu && filteredSlashCommands.length){executeSlashCommand(filteredSlashCommands[slashIdx].cmd)}else{sendMessage()}}"
+                          @keydown.enter.prevent="if(!$event.isComposing && !$event.shiftKey){if(showModelPicker && filteredModelPicker.length){pickModel(filteredModelPicker[modelPickerIdx].id)}else if(showSlashMenu && filteredSlashCommands.length){executeSlashCommand(filteredSlashCommands[slashIdx].cmd)}else{sendMessage()}}"
                           @keydown.escape="showSlashMenu = false; showModelPicker = false"
                           @keydown.arrow-up.prevent="if(showModelPicker){modelPickerIdx = Math.max(0, modelPickerIdx - 1)}else if(showSlashMenu){slashIdx = Math.max(0, slashIdx - 1)}"
                           @keydown.arrow-down.prevent="if(showModelPicker){modelPickerIdx = Math.min(filteredModelPicker.length - 1, modelPickerIdx + 1)}else if(showSlashMenu){slashIdx = Math.min(filteredSlashCommands.length - 1, slashIdx + 1)}"
@@ -1485,7 +1486,7 @@
                 <div>
                   <div class="form-group">
                     <label class="text-xs">Label</label>
-                    <input class="form-input" x-model="selectedNode.label" style="font-size:11px">
+                    <input class="form-input" x-model="selectedNode.label" @input="applyNodeEdit()" style="font-size:11px">
                   </div>
 
                   <!-- Agent config -->
@@ -1493,7 +1494,7 @@
                     <div>
                       <div class="form-group">
                         <label class="text-xs">Agent</label>
-                        <select class="form-select" x-model="selectedNode.config.agent_name" style="font-size:11px">
+                        <select class="form-select" x-model="selectedNode.config.agent_name" @change="applyNodeEdit()" style="font-size:11px">
                           <option value="">Select agent...</option>
                           <template x-for="a in agents" :key="a.id || a.name">
                             <option :value="a.name" x-text="a.name"></option>
@@ -1502,11 +1503,11 @@
                       </div>
                       <div class="form-group">
                         <label class="text-xs">Prompt Template</label>
-                        <textarea class="form-textarea" x-model="selectedNode.config.prompt" style="font-size:11px;min-height:60px" placeholder="{{input}}"></textarea>
+                        <textarea class="form-textarea" x-model="selectedNode.config.prompt" @input="applyNodeEdit()" style="font-size:11px;min-height:60px" placeholder="{{input}}"></textarea>
                       </div>
                       <div class="form-group">
                         <label class="text-xs">Model (optional)</label>
-                        <input class="form-input" x-model="selectedNode.config.model" style="font-size:11px" placeholder="Default model">
+                        <input class="form-input" x-model="selectedNode.config.model" @input="applyNodeEdit()" style="font-size:11px" placeholder="Default model">
                       </div>
                     </div>
                   </template>
@@ -1516,7 +1517,7 @@
                     <div>
                       <div class="form-group">
                         <label class="text-xs">Expression</label>
-                        <input class="form-input" x-model="selectedNode.config.expression" style="font-size:11px" placeholder="output.contains('yes')">
+                        <input class="form-input" x-model="selectedNode.config.expression" @input="applyNodeEdit()" style="font-size:11px" placeholder="output.contains('yes')">
                       </div>
                       <div class="text-xs text-dim">Top port = true, bottom port = false</div>
                     </div>
@@ -1527,11 +1528,11 @@
                     <div>
                       <div class="form-group">
                         <label class="text-xs">Max Iterations</label>
-                        <input type="number" class="form-input" x-model.number="selectedNode.config.max_iterations" style="font-size:11px" min="1" max="100">
+                        <input type="number" class="form-input" x-model.number="selectedNode.config.max_iterations" @input="applyNodeEdit()" style="font-size:11px" min="1" max="100">
                       </div>
                       <div class="form-group">
                         <label class="text-xs">Until (stop condition)</label>
-                        <input class="form-input" x-model="selectedNode.config.until" style="font-size:11px" placeholder="output === 'done'">
+                        <input class="form-input" x-model="selectedNode.config.until" @input="applyNodeEdit()" style="font-size:11px" placeholder="output === 'done'">
                       </div>
                     </div>
                   </template>
@@ -1541,7 +1542,7 @@
                     <div>
                       <div class="form-group">
                         <label class="text-xs">Fan-out Count</label>
-                        <input type="number" class="form-input" x-model.number="selectedNode.config.fan_count" style="font-size:11px" min="2" max="10">
+                        <input type="number" class="form-input" x-model.number="selectedNode.config.fan_count" @input="applyNodeEdit()" style="font-size:11px" min="2" max="10">
                       </div>
                     </div>
                   </template>
@@ -1551,7 +1552,7 @@
                     <div>
                       <div class="form-group">
                         <label class="text-xs">Strategy</label>
-                        <select class="form-select" x-model="selectedNode.config.strategy" style="font-size:11px">
+                        <select class="form-select" x-model="selectedNode.config.strategy" @change="applyNodeEdit()" style="font-size:11px">
                           <option value="all">Wait for all</option>
                           <option value="first">First to finish</option>
                           <option value="majority">Majority vote</option>
@@ -3401,11 +3402,11 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
           <!-- Network tab -->
           <div x-show="tab === 'network'" x-data="{
             netStatus: null, a2aAgents: [], a2aDiscoverUrl: '', a2aDiscovering: false,
-            async loadNetStatus() { try { this.netStatus = await (await fetch('/api/network/status')).json(); } catch(e) {} },
-            async loadA2aAgents() { try { let r = await (await fetch('/api/a2a/agents')).json(); this.a2aAgents = r.agents || []; } catch(e) {} },
+            async loadNetStatus() { try { this.netStatus = await OpenFangAPI.get('/api/network/status'); } catch(e) {} },
+            async loadA2aAgents() { try { let r = await OpenFangAPI.get('/api/a2a/agents'); this.a2aAgents = r.agents || []; } catch(e) {} },
             async discoverA2a() {
               if (!this.a2aDiscoverUrl) return; this.a2aDiscovering = true;
-              try { await fetch('/api/a2a/discover', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:this.a2aDiscoverUrl})}); this.a2aDiscoverUrl=''; await this.loadA2aAgents(); } catch(e) {}
+              try { await OpenFangAPI.post('/api/a2a/discover', {url:this.a2aDiscoverUrl}); this.a2aDiscoverUrl=''; await this.loadA2aAgents(); } catch(e) {}
               this.a2aDiscovering = false;
             }
           }" x-init="loadNetStatus(); loadA2aAgents()">
@@ -3487,14 +3488,14 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
           <div x-show="tab === 'budget'" x-data="{
             budgetData: null, agentRanking: [], budgetLoading: true,
             editMode: false,
-            editHourly: '', editDaily: '', editMonthly: '', editAlert: '',
+            editHourly: '', editDaily: '', editMonthly: '', editAlert: '', editTokenLimit: '',
             saving: false,
             async loadBudget() {
               this.budgetLoading = true;
               try {
                 let [b, a] = await Promise.all([
-                  fetch('/api/budget').then(r => r.json()),
-                  fetch('/api/budget/agents').then(r => r.json())
+                  OpenFangAPI.get('/api/budget'),
+                  OpenFangAPI.get('/api/budget/agents')
                 ]);
                 this.budgetData = b;
                 this.agentRanking = a.agents || [];
@@ -3506,6 +3507,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               this.editDaily = this.budgetData.daily_limit || 0;
               this.editMonthly = this.budgetData.monthly_limit || 0;
               this.editAlert = ((this.budgetData.alert_threshold || 0.8) * 100).toFixed(0);
+              this.editTokenLimit = this.budgetData.default_max_llm_tokens_per_hour || 0;
               this.editMode = true;
             },
             async saveBudget() {
@@ -3517,12 +3519,14 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                 if (+this.editMonthly !== this.budgetData.monthly_limit) body.max_monthly_usd = +this.editMonthly;
                 let alertVal = (+this.editAlert) / 100;
                 if (Math.abs(alertVal - this.budgetData.alert_threshold) > 0.001) body.alert_threshold = alertVal;
-                await fetch('/api/budget', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+                if (+this.editTokenLimit !== (this.budgetData.default_max_llm_tokens_per_hour || 0)) body.default_max_llm_tokens_per_hour = +this.editTokenLimit;
+                await OpenFangAPI.put('/api/budget', body);
                 this.editMode = false;
                 await this.loadBudget();
-              } catch(e) { alert('Failed to save: ' + e); }
+              } catch(e) { OpenFangToast.error('Failed to save: ' + (e.message || e)); }
               this.saving = false;
             },
+            fmtTokens(v) { return v > 0 ? (v >= 1000000 ? (v/1000000).toFixed(1)+'M' : v >= 1000 ? (v/1000).toFixed(0)+'K' : v) : 'per-agent'; },
             pctColor(pct) { return pct >= 0.8 ? '#ef4444' : pct >= 0.5 ? '#eab308' : '#22c55e'; },
             fmtUsd(v) { return v > 0 ? '$' + v.toFixed(4) : 'unlimited'; }
           }" x-init="loadBudget()">
@@ -3562,8 +3566,11 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                   </div>
                 </div>
               </div>
-              <div class="text-xs text-dim mb-3" x-show="budgetData.alert_threshold > 0 && !editMode">
+              <div class="text-xs text-dim mb-1" x-show="budgetData.alert_threshold > 0 && !editMode">
                 Alert threshold: <span x-text="(budgetData.alert_threshold * 100).toFixed(0) + '%'"></span> of any limit
+              </div>
+              <div class="text-xs text-dim mb-3" x-show="!editMode">
+                Hourly token limit (per agent): <span x-text="fmtTokens(budgetData.default_max_llm_tokens_per_hour || 0)"></span>
               </div>
 
               <!-- Edit limits form -->
@@ -3586,7 +3593,11 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                     <input type="number" step="5" min="0" max="100" x-model="editAlert" class="input" style="width:100%;margin-top:2px" placeholder="80">
                   </div>
                 </div>
-                <div class="text-xs text-dim">Set to 0 for unlimited. Changes apply immediately (in-memory, not persisted to config.toml).</div>
+                <div style="margin-bottom:8px">
+                  <label class="text-xs text-dim">Hourly Token Limit (per agent, 0 = use per-agent values)</label>
+                  <input type="number" step="100000" min="0" x-model="editTokenLimit" class="input" style="width:260px;margin-top:2px" placeholder="0 = per-agent default">
+                </div>
+                <div class="text-xs text-dim">Set to 0 for unlimited/per-agent default. Changes apply immediately (in-memory, not persisted to config.toml).</div>
                 <button class="btn btn-sm mt-2" @click="editMode = false" style="margin-right:8px">Cancel</button>
               </div>
 
@@ -3594,7 +3605,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               <h4 style="margin-top:16px;margin-bottom:8px">Top Spenders (Today)</h4>
               <div class="table-wrap" x-show="agentRanking.length">
                 <table>
-                  <thead><tr><th>Agent</th><th>Today</th><th>Hourly Limit</th><th>Daily Limit</th><th>Monthly Limit</th></tr></thead>
+                  <thead><tr><th>Agent</th><th>Today</th><th>Hourly Limit</th><th>Daily Limit</th><th>Monthly Limit</th><th>Token Limit/hr</th></tr></thead>
                   <tbody>
                     <template x-for="a in agentRanking" :key="a.agent_id">
                       <tr>
@@ -3603,6 +3614,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                         <td class="text-dim" x-text="fmtUsd(a.hourly_limit)"></td>
                         <td class="text-dim" x-text="fmtUsd(a.daily_limit)"></td>
                         <td class="text-dim" x-text="fmtUsd(a.monthly_limit)"></td>
+                        <td class="text-dim" x-text="fmtTokens(a.max_llm_tokens_per_hour || 0)"></td>
                       </tr>
                     </template>
                   </tbody>
@@ -4499,7 +4511,29 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                 </div>
               </div>
 
-              <template x-if="selectedProviderObj && !providerIsConfigured(selectedProviderObj)">
+              <template x-if="selectedProviderObj && !providerIsConfigured(selectedProviderObj) && selectedProvider === 'claude-code'">
+                <div class="card" style="border-left:3px solid var(--accent);margin-top:16px">
+                  <div class="card-header">Configure Claude Code</div>
+                  <div class="text-xs text-dim mb-2" style="line-height:1.8">
+                    Claude Code uses its own CLI authentication &mdash; no API key needed.
+                  </div>
+                  <div style="background:var(--bg);border-radius:4px;padding:10px 12px;margin-bottom:12px;font-size:12px;line-height:1.8">
+                    <div><span style="color:var(--accent)">1.</span> Install: <code style="color:var(--accent-light);background:var(--bg-secondary);padding:1px 4px;border-radius:2px">npm install -g @anthropic-ai/claude-code</code></div>
+                    <div><span style="color:var(--accent)">2.</span> Authenticate: <code style="color:var(--accent-light);background:var(--bg-secondary);padding:1px 4px;border-radius:2px">claude auth</code></div>
+                    <div><span style="color:var(--accent)">3.</span> Click <strong>Detect</strong> below to verify</div>
+                  </div>
+                  <button class="btn btn-primary btn-sm" @click="detectClaudeCode()" :disabled="testingProvider">
+                    <span x-show="!testingProvider">Detect Claude Code</span>
+                    <span x-show="testingProvider" class="spinner" style="width:10px;height:10px;border-width:2px"></span>
+                  </button>
+                  <div x-show="testResult" class="mt-2">
+                    <div x-show="testResult && testResult.status === 'ok'" class="badge badge-success" style="padding:6px 12px">Claude Code detected<span x-show="testResult && testResult.latency_ms" x-text="' (' + (testResult ? testResult.latency_ms : '') + 'ms)'"></span></div>
+                    <div x-show="testResult && testResult.status !== 'ok'" class="badge badge-error" style="padding:6px 12px">Claude Code CLI not detected. Make sure you&rsquo;ve run: <code>npm install -g @anthropic-ai/claude-code &amp;&amp; claude auth</code></div>
+                  </div>
+                </div>
+              </template>
+
+              <template x-if="selectedProviderObj && !providerIsConfigured(selectedProviderObj) && selectedProvider !== 'claude-code'">
                 <div class="card" style="border-left:3px solid var(--accent);margin-top:16px">
                   <div class="card-header" x-text="'Configure ' + selectedProviderObj.display_name"></div>
                   <div class="text-xs text-dim mb-2" x-show="selectedProviderObj.api_key_env">
