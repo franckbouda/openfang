@@ -8,7 +8,7 @@ use openfang_kernel::OpenFangKernel;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 use tokio::sync::watch;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Handle to the running embedded server. Drop or call `shutdown()` to stop.
 pub struct ServerHandle {
@@ -16,6 +16,8 @@ pub struct ServerHandle {
     pub port: u16,
     /// The kernel instance (shared with the server).
     pub kernel: Arc<OpenFangKernel>,
+    /// Display key for vault (if newly generated).
+    pub vault_display_key: Option<String>,
     /// Send `true` to trigger graceful shutdown.
     shutdown_tx: watch::Sender<bool>,
     /// Join handle for the background server thread.
@@ -47,6 +49,44 @@ impl Drop for ServerHandle {
 /// any Tauri window is created. The actual axum server runs on a dedicated
 /// thread with its own tokio runtime.
 pub fn start_server() -> Result<ServerHandle, Box<dyn std::error::Error>> {
+    // Auto-initialize vault and migrate config.toml secrets
+    let home = openfang_kernel::config::openfang_home();
+    let vault_path = home.join("vault.enc");
+    let config_path = home.join("config.toml");
+    let mut vault_display_key: Option<String> = None;
+
+    if !vault_path.exists() {
+        let mut vault = openfang_extensions::vault::CredentialVault::new(vault_path.clone());
+        match vault.init_and_get_display_key() {
+            Ok(Some(key)) => {
+                info!("Vault created with new master key");
+                vault_display_key = Some(key.as_str().to_string());
+            }
+            Ok(None) => info!("Vault created (key from OS keyring)"),
+            Err(e) => warn!("Could not init vault: {e}"),
+        }
+    }
+
+    if vault_path.exists() && config_path.exists() {
+        let mut vault = openfang_extensions::vault::CredentialVault::new(vault_path.clone());
+        if vault.unlock().is_ok() {
+            match openfang_extensions::credentials::migrate_config_to_vault(
+                &config_path,
+                &mut vault,
+            ) {
+                Ok(migrated) if !migrated.is_empty() => {
+                    info!(
+                        "Migrated {} credential(s) from config.toml to vault: {}",
+                        migrated.len(),
+                        migrated.join(", ")
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => warn!("Migration config.toml→vault skipped: {e}"),
+            }
+        }
+    }
+
     // Boot kernel (sync — no tokio needed)
     let kernel = OpenFangKernel::boot(None)?;
     let kernel = Arc::new(kernel);
@@ -81,6 +121,7 @@ pub fn start_server() -> Result<ServerHandle, Box<dyn std::error::Error>> {
     Ok(ServerHandle {
         port,
         kernel,
+        vault_display_key,
         shutdown_tx,
         server_thread: Some(server_thread),
     })

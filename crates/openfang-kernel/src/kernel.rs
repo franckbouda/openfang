@@ -4063,6 +4063,39 @@ impl OpenFangKernel {
             .unwrap_or(&self.config.default_model);
         let default_provider = &effective_default.provider;
 
+        // Multi-account Claude Code rotation
+        if agent_provider == "claude-code" && !self.config.claude_code_accounts.is_empty() {
+            use openfang_runtime::drivers::fallback::FallbackDriver;
+            use openfang_runtime::drivers::claude_code::ClaudeCodeDriver;
+
+            let accounts = &self.config.claude_code_accounts;
+            if accounts.len() == 1 {
+                let acc = &accounts[0];
+                return Ok(Arc::new(ClaudeCodeDriver::new_with_config(
+                    acc.cli_path.clone(),
+                    Some(acc.config_dir.clone()),
+                )));
+            }
+
+            let chain: Vec<(Arc<dyn openfang_runtime::llm_driver::LlmDriver>, String)> = accounts
+                .iter()
+                .map(|acc| {
+                    let label = acc.label.clone().unwrap_or_else(|| acc.config_dir.clone());
+                    tracing::info!(account = %label, "Registered Claude Code account for rotation");
+                    let driver: Arc<dyn openfang_runtime::llm_driver::LlmDriver> = Arc::new(
+                        ClaudeCodeDriver::new_with_config(
+                            acc.cli_path.clone(),
+                            Some(acc.config_dir.clone()),
+                        )
+                    );
+                    (driver, String::new())
+                })
+                .collect();
+
+            return Ok(Arc::new(FallbackDriver::with_models(chain)));
+        }
+
+        // If agent uses same provider as kernel default and has no custom overrides, reuse
         let has_custom_key = manifest.model.api_key_env.is_some();
         let has_custom_url = manifest.model.base_url.is_some();
 

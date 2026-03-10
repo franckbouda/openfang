@@ -351,6 +351,91 @@ openfang start
 
 ---
 
+## Build from Source
+
+### Prerequisites
+
+- [Rust toolchain](https://rustup.rs/) (stable, 1.75+)
+- An LLM API key (at least one): Groq (free), OpenAI, Anthropic, DeepSeek, Ollama (local), etc.
+
+### Build
+
+```bash
+git clone https://github.com/RightNow-AI/openfang.git
+cd openfang
+
+# Debug build (faster compile)
+cargo build --workspace --lib
+
+# Release build (optimized binary)
+cargo build --release -p openfang-cli
+```
+
+The binary is at `target/release/openfang` (~32 MB).
+
+### Configure
+
+Create `~/.openfang/config.toml`:
+
+```toml
+[auth]
+profiles = [
+    { provider = "groq", model = "llama-3.3-70b-versatile", api_key_env = "GROQ_API_KEY" },
+    # Add more providers as needed:
+    # { provider = "anthropic", model = "claude-sonnet-4-20250514", api_key_env = "ANTHROPIC_API_KEY" },
+    # { provider = "openai", model = "gpt-4o", api_key_env = "OPENAI_API_KEY" },
+]
+
+[kernel]
+default_model = "llama-3.3-70b-versatile"
+```
+
+### Run
+
+```bash
+# Set your API key
+export GROQ_API_KEY="gsk_your_key_here"
+
+# Start the daemon
+./target/release/openfang start
+
+# Verify it's running
+curl -s http://127.0.0.1:4200/api/health
+
+# Open the dashboard
+open http://127.0.0.1:4200
+```
+
+### Test the API
+
+```bash
+# List agents
+curl -s http://127.0.0.1:4200/api/agents
+
+# Send a message to an agent
+curl -s -X POST "http://127.0.0.1:4200/api/agents/<agent-id>/message" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Say hello in 5 words."}'
+
+# Check budget
+curl -s http://127.0.0.1:4200/api/budget
+
+# Activate a Hand
+curl -s -X POST http://127.0.0.1:4200/api/hands/researcher/activate
+```
+
+### Stop
+
+```bash
+# macOS / Linux
+pkill -f openfang
+
+# Windows (Git Bash / MSYS2)
+taskkill //PID <pid> //F
+```
+
+---
+
 ## Development
 
 ```bash
@@ -359,6 +444,12 @@ cargo build --workspace --lib
 
 # Run all tests (1,767+)
 cargo test --workspace
+
+# Test a single crate
+cargo test -p openfang-runtime
+
+# Test specific functions
+cargo test -p openfang-kernel -- scheduler
 
 # Lint (must be 0 warnings)
 cargo clippy --workspace --all-targets -- -D warnings

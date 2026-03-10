@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use openfang_types::message::{ContentBlock, Role, StopReason, TokenUsage};
 use serde::Deserialize;
 use tokio::io::AsyncBufReadExt;
-use tracing::{debug, warn};
+use tracing::warn;
 
 /// Environment variable names (and suffixes) to strip from the subprocess
 /// to prevent leaking API keys from other providers. We keep the full env
@@ -47,6 +47,8 @@ const SENSITIVE_SUFFIXES: &[&str] = &["_SECRET", "_TOKEN", "_PASSWORD"];
 /// LLM driver that delegates to the Claude Code CLI.
 pub struct ClaudeCodeDriver {
     cli_path: String,
+    /// Config directory injected as CLAUDE_CONFIG_DIR (multi-account support).
+    config_dir: Option<String>,
 }
 
 impl ClaudeCodeDriver {
@@ -58,6 +60,17 @@ impl ClaudeCodeDriver {
             cli_path: cli_path
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "claude".to_string()),
+            config_dir: None,
+        }
+    }
+
+    /// Create a driver with a specific config directory (for multi-account rotation).
+    pub fn new_with_config(cli_path: Option<String>, config_dir: Option<String>) -> Self {
+        Self {
+            cli_path: cli_path
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "claude".to_string()),
+            config_dir: config_dir.filter(|s| !s.is_empty()),
         }
     }
 
@@ -178,6 +191,42 @@ struct ClaudeStreamEvent {
     usage: Option<ClaudeUsage>,
 }
 
+/// Expand `~/` to the actual home directory.
+fn expand_tilde(path: &str) -> String {
+    if let Some(stripped) = path.strip_prefix("~/") {
+        #[cfg(not(target_os = "windows"))]
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}/{}", home, stripped);
+        }
+        #[cfg(target_os = "windows")]
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            return format!("{}/{}", home, stripped);
+        }
+    }
+    path.to_string()
+}
+
+/// Classify Claude CLI error output into the appropriate LlmError variant.
+fn classify_claude_cli_error(output: &str, status_code: u16) -> LlmError {
+    let lower = output.to_lowercase();
+    if lower.contains("usage limit")
+        || lower.contains("rate limit")
+        || lower.contains("quota exceeded")
+        || lower.contains("too many requests")
+        || lower.contains("claude.ai/upgrade")
+        || lower.contains("free limit")
+        || lower.contains("billing")
+    {
+        return LlmError::RateLimited {
+            retry_after_ms: 0,
+        };
+    }
+    LlmError::Api {
+        status: status_code,
+        message: format!("Claude CLI failed: {output}"),
+    }
+}
+
 #[async_trait]
 impl LlmDriver for ClaudeCodeDriver {
     async fn complete(
@@ -188,6 +237,12 @@ impl LlmDriver for ClaudeCodeDriver {
         let model_flag = Self::model_flag(&request.model);
 
         let mut cmd = tokio::process::Command::new(&self.cli_path);
+
+        if let Some(ref dir) = self.config_dir {
+            let expanded = expand_tilde(dir);
+            cmd.env("CLAUDE_CONFIG_DIR", &expanded);
+        }
+
         cmd.arg("-p")
             .arg(&prompt)
             .arg("--output-format")
@@ -199,10 +254,13 @@ impl LlmDriver for ClaudeCodeDriver {
 
         Self::apply_env_filter(&mut cmd);
 
+        // Null stdin so the CLI never blocks waiting for terminal input.
+        cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        debug!(cli = %self.cli_path, "Spawning Claude Code CLI");
+        let config_label = self.config_dir.as_deref().unwrap_or("default");
+        tracing::info!(cli = %self.cli_path, config_dir = %config_label, "Spawning Claude Code CLI");
 
         let output = cmd
             .output()
@@ -215,11 +273,18 @@ impl LlmDriver for ClaudeCodeDriver {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let detail = if !stderr.is_empty() { &stderr } else { &stdout };
+            let stdout_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let detail = if !stderr.is_empty() { &stderr } else { &stdout_str };
             let code = output.status.code().unwrap_or(1);
 
-            // Provide actionable error messages
+            // Check for rate-limit / quota signals first via the classifier.
+            let combined = format!("{stderr}{stdout_str}");
+            let classified = classify_claude_cli_error(&combined, code as u16);
+            if matches!(classified, LlmError::RateLimited { .. }) {
+                return Err(classified);
+            }
+
+            // Provide actionable error messages for auth and permission issues.
             let message = if detail.contains("not authenticated")
                 || detail.contains("auth")
                 || detail.contains("login")
@@ -287,6 +352,12 @@ impl LlmDriver for ClaudeCodeDriver {
         let model_flag = Self::model_flag(&request.model);
 
         let mut cmd = tokio::process::Command::new(&self.cli_path);
+
+        if let Some(ref dir) = self.config_dir {
+            let expanded = expand_tilde(dir);
+            cmd.env("CLAUDE_CONFIG_DIR", &expanded);
+        }
+
         cmd.arg("-p")
             .arg(&prompt)
             .arg("--output-format")
@@ -299,10 +370,15 @@ impl LlmDriver for ClaudeCodeDriver {
 
         Self::apply_env_filter(&mut cmd);
 
+        // Null stdin so the CLI never blocks waiting for terminal input.
+        cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
+        // Pipe stderr and drain it concurrently to prevent pipe buffer deadlock.
+        // With --verbose, the CLI writes heavily to stderr; leaving it unread blocks the process.
         cmd.stderr(std::process::Stdio::piped());
 
-        debug!(cli = %self.cli_path, "Spawning Claude Code CLI (streaming)");
+        let config_label = self.config_dir.as_deref().unwrap_or("default");
+        tracing::info!(cli = %self.cli_path, config_dir = %config_label, "Spawning Claude Code CLI (streaming)");
 
         let mut child = cmd
             .spawn()
@@ -317,6 +393,16 @@ impl LlmDriver for ClaudeCodeDriver {
             .take()
             .ok_or_else(|| LlmError::Http("No stdout from claude CLI".to_string()))?;
 
+        // Drain stderr in a background task to prevent pipe buffer deadlock.
+        let stderr_handle = child.stderr.take();
+        let stderr_task: tokio::task::JoinHandle<String> = tokio::spawn(async move {
+            let mut buf = String::new();
+            if let Some(mut se) = stderr_handle {
+                let _ = tokio::io::AsyncReadExt::read_to_string(&mut se, &mut buf).await;
+            }
+            buf
+        });
+
         let reader = tokio::io::BufReader::new(stdout);
         let mut lines = reader.lines();
 
@@ -325,10 +411,16 @@ impl LlmDriver for ClaudeCodeDriver {
             input_tokens: 0,
             output_tokens: 0,
         };
+        let mut first_line_logged = false;
 
         while let Ok(Some(line)) = lines.next_line().await {
             if line.trim().is_empty() {
                 continue;
+            }
+
+            if !first_line_logged {
+                tracing::info!(first_line = %&line[..line.len().min(200)], "Claude CLI first stdout line");
+                first_line_logged = true;
             }
 
             match serde_json::from_str::<ClaudeStreamEvent>(&line) {
@@ -392,8 +484,16 @@ impl LlmDriver for ClaudeCodeDriver {
             .await
             .map_err(|e| LlmError::Http(format!("Claude CLI wait failed: {e}")))?;
 
+        // Collect stderr output (already being drained by the background task)
+        let stderr_text = stderr_task.await.unwrap_or_default();
+
         if !status.success() {
-            warn!(code = ?status.code(), "Claude CLI exited with error");
+            warn!(code = ?status.code(), stderr = %stderr_text.trim(), "Claude CLI exited with error");
+            if full_text.is_empty() {
+                return Err(classify_claude_cli_error(&stderr_text, status.code().unwrap_or(1) as u16));
+            }
+        } else {
+            tracing::info!(config_dir = %config_label, chars = full_text.len(), "Claude CLI stream completed");
         }
 
         let _ = tx
@@ -519,5 +619,30 @@ mod tests {
         assert!(SENSITIVE_ENV_EXACT.contains(&"GEMINI_API_KEY"));
         assert!(SENSITIVE_ENV_EXACT.contains(&"GROQ_API_KEY"));
         assert!(SENSITIVE_ENV_EXACT.contains(&"DEEPSEEK_API_KEY"));
+    }
+
+    #[test]
+    fn test_classify_usage_limit() {
+        let err = classify_claude_cli_error("Error: usage limit exceeded. Visit claude.ai/upgrade", 1);
+        assert!(matches!(err, LlmError::RateLimited { .. }));
+    }
+
+    #[test]
+    fn test_classify_rate_limit() {
+        let err = classify_claude_cli_error("rate limit exceeded, try again later", 429);
+        assert!(matches!(err, LlmError::RateLimited { .. }));
+    }
+
+    #[test]
+    fn test_classify_generic_error() {
+        let err = classify_claude_cli_error("Permission denied: /dev/null", 1);
+        assert!(matches!(err, LlmError::Api { .. }));
+    }
+
+    #[test]
+    fn test_expand_tilde() {
+        let result = expand_tilde("~/foo/bar");
+        assert!(!result.starts_with('~'));
+        assert!(result.ends_with("/foo/bar"));
     }
 }

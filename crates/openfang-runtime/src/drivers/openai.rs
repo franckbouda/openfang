@@ -390,7 +390,10 @@ impl LlmDriver for OpenAIDriver {
             }
 
             if !resp.status().is_success() {
-                let body = resp.text().await.unwrap_or_default();
+                let body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("(failed to read response: {e})"));
 
                 // Groq "tool_use_failed": model generated tool call in XML format.
                 // Parse the failed_generation and convert to a proper tool call response.
@@ -541,7 +544,12 @@ impl LlmDriver for OpenAIDriver {
             if let Some(calls) = choice.message.tool_calls {
                 for call in calls {
                     let input: serde_json::Value =
-                        serde_json::from_str(&call.function.arguments).unwrap_or_default();
+                        serde_json::from_str(&call.function.arguments).map_err(|e| {
+                            LlmError::Parse(format!(
+                                "Invalid tool arguments for '{}': {}",
+                                call.function.name, e
+                            ))
+                        })?;
                     content.push(ContentBlock::ToolUse {
                         id: call.id.clone(),
                         name: call.function.name.clone(),
@@ -785,7 +793,10 @@ impl LlmDriver for OpenAIDriver {
             }
 
             if !resp.status().is_success() {
-                let body = resp.text().await.unwrap_or_default();
+                let body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("(failed to read response: {e})"));
 
                 // Groq "tool_use_failed": parse and recover (streaming path)
                 if status == 400 && body.contains("tool_use_failed") {
@@ -1089,7 +1100,13 @@ impl LlmDriver for OpenAIDriver {
             }
 
             for (id, name, arguments) in &tool_accum {
-                let input: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+                let input: serde_json::Value =
+                    serde_json::from_str(arguments).map_err(|e| {
+                        LlmError::Parse(format!(
+                            "Invalid tool arguments for '{}': {}",
+                            name, e
+                        ))
+                    })?;
                 content.push(ContentBlock::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
@@ -1098,14 +1115,14 @@ impl LlmDriver for OpenAIDriver {
                 tool_calls.push(ToolCall {
                     id: id.clone(),
                     name: name.clone(),
-                    input,
+                    input: input.clone(),
                 });
 
                 let _ = tx
                     .send(StreamEvent::ToolUseEnd {
                         id: id.clone(),
                         name: name.clone(),
-                        input: serde_json::from_str(arguments).unwrap_or_default(),
+                        input,
                     })
                     .await;
             }
@@ -1291,8 +1308,10 @@ fn parse_groq_failed_tool_call(body: &str) -> Option<CompletionResponse> {
         };
 
         // Parse args as JSON Value
-        let args_value: serde_json::Value =
-            serde_json::from_str(args).unwrap_or(serde_json::json!({}));
+        let args_value: serde_json::Value = serde_json::from_str(args).unwrap_or_else(|e| {
+            tracing::warn!("Failed to parse recovered Groq tool arguments: {e}");
+            serde_json::json!({})
+        });
 
         tool_calls.push(ToolCall {
             id: format!("groq_recovered_{}", tool_calls.len()),
