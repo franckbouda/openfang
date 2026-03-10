@@ -1062,6 +1062,12 @@ pub struct KernelConfig {
     /// e.g. `ollama = "http://192.168.1.100:11434/v1"`
     #[serde(default)]
     pub provider_urls: HashMap<String, String>,
+    /// Provider API key env var overrides (provider ID → env var name).
+    /// For custom/unknown providers, maps the provider name to the environment
+    /// variable holding the API key. e.g. `nvidia = "NVIDIA_API_KEY"`.
+    /// If not set, the convention `{PROVIDER_UPPER}_API_KEY` is used automatically.
+    #[serde(default)]
+    pub provider_api_keys: HashMap<String, String>,
     /// OAuth client ID overrides for PKCE flows.
     #[serde(default)]
     pub oauth: OAuthConfig,
@@ -1102,6 +1108,11 @@ pub struct BudgetConfig {
     pub max_monthly_usd: f64,
     /// Alert threshold as a fraction (0.0 - 1.0). Trigger warnings at this % of any limit.
     pub alert_threshold: f64,
+    /// Default per-agent hourly token limit override. When set (> 0), agents that
+    /// still have the built-in default (1,000,000) or a lower per-agent value will
+    /// be overridden to this value. Set to 0 to keep each agent's own limit.
+    /// Use this to globally raise or lower the token budget for all agents.
+    pub default_max_llm_tokens_per_hour: u64,
 }
 
 impl Default for BudgetConfig {
@@ -1111,6 +1122,7 @@ impl Default for BudgetConfig {
             max_daily_usd: 0.0,
             max_monthly_usd: 0.0,
             alert_threshold: 0.8,
+            default_max_llm_tokens_per_hour: 0,
         }
     }
 }
@@ -1186,6 +1198,10 @@ fn default_language() -> String {
     "en".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for KernelConfig {
     fn default() -> Self {
         let home_dir = openfang_home_dir();
@@ -1231,6 +1247,7 @@ impl Default for KernelConfig {
             thinking: None,
             budget: BudgetConfig::default(),
             provider_urls: HashMap::new(),
+            provider_api_keys: HashMap::new(),
             oauth: OAuthConfig::default(),
         }
     }
@@ -1242,6 +1259,27 @@ impl KernelConfig {
         self.workspaces_dir
             .clone()
             .unwrap_or_else(|| self.home_dir.join("workspaces"))
+    }
+
+    /// Resolve the API key env var name for a provider.
+    ///
+    /// Checks: 1) explicit `provider_api_keys` mapping, 2) `auth_profiles` first entry,
+    /// 3) convention `{PROVIDER_UPPER}_API_KEY`.
+    pub fn resolve_api_key_env(&self, provider: &str) -> String {
+        // 1. Explicit mapping in [provider_api_keys]
+        if let Some(env_var) = self.provider_api_keys.get(provider) {
+            return env_var.clone();
+        }
+        // 2. Auth profiles (first profile by priority)
+        if let Some(profiles) = self.auth_profiles.get(provider) {
+            let mut sorted: Vec<_> = profiles.iter().collect();
+            sorted.sort_by_key(|p| p.priority);
+            if let Some(best) = sorted.first() {
+                return best.api_key_env.clone();
+            }
+        }
+        // 3. Convention: NVIDIA → NVIDIA_API_KEY
+        format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"))
     }
 }
 
@@ -1324,6 +1362,10 @@ impl std::fmt::Debug for KernelConfig {
                 &format!("{} provider(s)", self.auth_profiles.len()),
             )
             .field("thinking", &self.thinking.is_some())
+            .field(
+                "provider_api_keys",
+                &format!("{} mapping(s)", self.provider_api_keys.len()),
+            )
             .finish()
     }
 }
@@ -1557,6 +1599,10 @@ pub struct TelegramConfig {
     pub default_agent: Option<String>,
     /// Polling interval in seconds.
     pub poll_interval_secs: u64,
+    /// Custom Telegram Bot API base URL for proxies or mirrors.
+    /// Defaults to `https://api.telegram.org` when not set.
+    #[serde(default)]
+    pub api_url: Option<String>,
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
@@ -1569,6 +1615,7 @@ impl Default for TelegramConfig {
             allowed_users: vec![],
             default_agent: None,
             poll_interval_secs: 1,
+            api_url: None,
             overrides: ChannelOverrides::default(),
         }
     }
@@ -1591,6 +1638,10 @@ pub struct DiscordConfig {
     pub default_agent: Option<String>,
     /// Gateway intents bitmask (default: 37376 = GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT).
     pub intents: u64,
+    /// Ignore messages from other bots (default: true).
+    /// Set to false to allow bot-to-bot interactions in multi-agent setups.
+    #[serde(default = "default_true")]
+    pub ignore_bots: bool,
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
@@ -1604,6 +1655,7 @@ impl Default for DiscordConfig {
             allowed_users: vec![],
             default_agent: None,
             intents: 37376,
+            ignore_bots: true,
             overrides: ChannelOverrides::default(),
         }
     }
@@ -3283,6 +3335,24 @@ mod tests {
         assert_eq!(dc.bot_token_env, "DISCORD_BOT_TOKEN");
         assert!(dc.allowed_guilds.is_empty());
         assert_eq!(dc.intents, 37376);
+        assert!(dc.ignore_bots);
+    }
+
+    #[test]
+    fn test_discord_config_ignore_bots_deserialization() {
+        let toml_str = r#"
+            bot_token_env = "DISCORD_BOT_TOKEN"
+            ignore_bots = false
+        "#;
+        let dc: DiscordConfig = toml::from_str(toml_str).unwrap();
+        assert!(!dc.ignore_bots);
+
+        // Default (field omitted) should be true
+        let toml_str2 = r#"
+            bot_token_env = "DISCORD_BOT_TOKEN"
+        "#;
+        let dc2: DiscordConfig = toml::from_str(toml_str2).unwrap();
+        assert!(dc2.ignore_bots);
     }
 
     #[test]
@@ -3631,5 +3701,78 @@ mod tests {
         assert_eq!(config.browser.max_sessions, browser_sessions);
         assert_eq!(config.web.fetch.max_response_bytes, fetch_bytes);
         assert_eq!(config.web.fetch.timeout_secs, fetch_timeout);
+    }
+
+    #[test]
+    fn test_resolve_api_key_env_convention() {
+        let config = KernelConfig::default();
+        // Unknown provider falls back to convention
+        assert_eq!(config.resolve_api_key_env("nvidia"), "NVIDIA_API_KEY");
+        assert_eq!(config.resolve_api_key_env("my-custom"), "MY_CUSTOM_API_KEY");
+    }
+
+    #[test]
+    fn test_resolve_api_key_env_explicit_mapping() {
+        let mut config = KernelConfig::default();
+        config
+            .provider_api_keys
+            .insert("nvidia".to_string(), "NIM_KEY".to_string());
+        // Explicit mapping takes precedence over convention
+        assert_eq!(config.resolve_api_key_env("nvidia"), "NIM_KEY");
+    }
+
+    #[test]
+    fn test_resolve_api_key_env_auth_profiles() {
+        let mut config = KernelConfig::default();
+        config.auth_profiles.insert(
+            "nvidia".to_string(),
+            vec![AuthProfile {
+                name: "primary".to_string(),
+                api_key_env: "NVIDIA_PRIMARY_KEY".to_string(),
+                priority: 0,
+            }],
+        );
+        // Auth profiles take precedence over convention (but not explicit mapping)
+        assert_eq!(
+            config.resolve_api_key_env("nvidia"),
+            "NVIDIA_PRIMARY_KEY"
+        );
+    }
+
+    #[test]
+    fn test_resolve_api_key_env_explicit_over_auth_profile() {
+        let mut config = KernelConfig::default();
+        config
+            .provider_api_keys
+            .insert("nvidia".to_string(), "NIM_KEY".to_string());
+        config.auth_profiles.insert(
+            "nvidia".to_string(),
+            vec![AuthProfile {
+                name: "primary".to_string(),
+                api_key_env: "NVIDIA_PRIMARY_KEY".to_string(),
+                priority: 0,
+            }],
+        );
+        // Explicit mapping wins over auth profiles
+        assert_eq!(config.resolve_api_key_env("nvidia"), "NIM_KEY");
+    }
+
+    #[test]
+    fn test_provider_api_keys_toml_roundtrip() {
+        let toml_str = r#"
+            [provider_api_keys]
+            nvidia = "NVIDIA_NIM_KEY"
+            azure = "AZURE_OPENAI_KEY"
+        "#;
+        let config: KernelConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.provider_api_keys.len(), 2);
+        assert_eq!(
+            config.provider_api_keys.get("nvidia").unwrap(),
+            "NVIDIA_NIM_KEY"
+        );
+        assert_eq!(
+            config.provider_api_keys.get("azure").unwrap(),
+            "AZURE_OPENAI_KEY"
+        );
     }
 }
