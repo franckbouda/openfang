@@ -346,9 +346,22 @@ fn estimate_cost_rates(model: &str) -> (f64, f64) {
         return (0.40, 0.40);
     }
 
+    // ── Chutes.ai ──────────────────────────────────────────────
+    if model.contains("chutes") {
+        return (0.25, 0.35);
+    }
+
     // ── Venice.ai ──────────────────────────────────────────────
     if model.contains("venice") {
         return (0.20, 0.90);
+    }
+
+    // ── NVIDIA NIM ──────────────────────────────────────────────
+    if model.contains("nemotron-4-340b") {
+        return (4.20, 4.20);
+    }
+    if model.contains("nemotron") {
+        return (0.88, 0.88);
     }
 
     // ── Open-source (Groq, Together, etc.) ─────────────────────
@@ -379,7 +392,16 @@ fn estimate_cost_rates(model: &str) -> (f64, f64) {
     }
 
     // ── MiniMax ──────────────────────────────────────────────────
-    if model.contains("minimax") {
+    if model.contains("minimax") || model.contains("abab") {
+        if model.contains("highspeed") {
+            return (0.80, 3.20);
+        }
+        if model.contains("m2.5") {
+            return (1.10, 4.40);
+        }
+        if model.contains("abab7") {
+            return (0.80, 2.40);
+        }
         return (1.00, 3.00);
     }
 

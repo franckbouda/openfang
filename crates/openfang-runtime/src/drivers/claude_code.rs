@@ -49,19 +49,28 @@ pub struct ClaudeCodeDriver {
     cli_path: String,
     /// Config directory injected as CLAUDE_CONFIG_DIR (multi-account support).
     config_dir: Option<String>,
+    skip_permissions: bool,
 }
 
 impl ClaudeCodeDriver {
     /// Create a new Claude Code driver.
     ///
     /// `cli_path` overrides the CLI binary path; defaults to `"claude"` on PATH.
-    pub fn new(cli_path: Option<String>) -> Self {
+    pub fn new(cli_path: Option<String>, skip_permissions: bool) -> Self {
+        if skip_permissions {
+            warn!(
+                "Claude Code driver: --dangerously-skip-permissions enabled. \
+                 The CLI will not prompt for tool approvals. \
+                 OpenFang's own capability/RBAC system enforces access control."
+            );
+        }
         let raw = cli_path
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "claude".to_string());
         Self {
             cli_path: resolve_claude_path(&raw),
             config_dir: None,
+            skip_permissions,
         }
     }
 
@@ -71,13 +80,21 @@ impl ClaudeCodeDriver {
     }
 
     /// Create a driver with a specific config directory (for multi-account rotation).
-    pub fn new_with_config(cli_path: Option<String>, config_dir: Option<String>) -> Self {
+    pub fn new_with_config(cli_path: Option<String>, config_dir: Option<String>, skip_permissions: bool) -> Self {
+        if skip_permissions {
+            warn!(
+                "Claude Code driver: --dangerously-skip-permissions enabled. \
+                 The CLI will not prompt for tool approvals. \
+                 OpenFang's own capability/RBAC system enforces access control."
+            );
+        }
         let raw = cli_path
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "claude".to_string());
         Self {
             cli_path: resolve_claude_path(&raw),
             config_dir: config_dir.filter(|s| !s.is_empty()),
+            skip_permissions,
         }
     }
 
@@ -330,6 +347,10 @@ impl LlmDriver for ClaudeCodeDriver {
             .arg("--output-format")
             .arg("json");
 
+        if self.skip_permissions {
+            cmd.arg("--dangerously-skip-permissions");
+        }
+
         if let Some(ref model) = model_flag {
             cmd.arg("--model").arg(model);
         }
@@ -342,7 +363,7 @@ impl LlmDriver for ClaudeCodeDriver {
         cmd.stderr(std::process::Stdio::piped());
 
         let config_label = self.config_dir.as_deref().unwrap_or("default");
-        tracing::info!(cli = %self.cli_path, config_dir = %config_label, "Spawning Claude Code CLI");
+        tracing::info!(cli = %self.cli_path, config_dir = %config_label, skip_permissions = self.skip_permissions, "Spawning Claude Code CLI");
 
         let output = cmd
             .output()
@@ -402,7 +423,7 @@ impl LlmDriver for ClaudeCodeDriver {
                 .unwrap_or_default();
             let usage = parsed.usage.unwrap_or_default();
             return Ok(CompletionResponse {
-                content: vec![ContentBlock::Text { text: text.clone() }],
+                content: vec![ContentBlock::Text { text: text.clone(), provider_metadata: None }],
                 stop_reason: StopReason::EndTurn,
                 tool_calls: Vec::new(),
                 usage: TokenUsage {
@@ -415,7 +436,7 @@ impl LlmDriver for ClaudeCodeDriver {
         // Fallback: treat entire stdout as plain text
         let text = stdout.trim().to_string();
         Ok(CompletionResponse {
-            content: vec![ContentBlock::Text { text }],
+            content: vec![ContentBlock::Text { text, provider_metadata: None }],
             stop_reason: StopReason::EndTurn,
             tool_calls: Vec::new(),
             usage: TokenUsage {
@@ -446,6 +467,10 @@ impl LlmDriver for ClaudeCodeDriver {
             .arg("stream-json")
             .arg("--verbose");
 
+        if self.skip_permissions {
+            cmd.arg("--dangerously-skip-permissions");
+        }
+
         if let Some(ref model) = model_flag {
             cmd.arg("--model").arg(model);
         }
@@ -460,7 +485,7 @@ impl LlmDriver for ClaudeCodeDriver {
         cmd.stderr(std::process::Stdio::piped());
 
         let config_label = self.config_dir.as_deref().unwrap_or("default");
-        tracing::info!(cli = %self.cli_path, config_dir = %config_label, "Spawning Claude Code CLI (streaming)");
+        tracing::info!(cli = %self.cli_path, config_dir = %config_label, skip_permissions = self.skip_permissions, "Spawning Claude Code CLI (streaming)");
 
         let mut child = cmd
             .spawn()
@@ -586,7 +611,7 @@ impl LlmDriver for ClaudeCodeDriver {
             .await;
 
         Ok(CompletionResponse {
-            content: vec![ContentBlock::Text { text: full_text }],
+            content: vec![ContentBlock::Text { text: full_text, provider_metadata: None }],
             stop_reason: StopReason::EndTurn,
             tool_calls: Vec::new(),
             usage: final_usage,
@@ -677,20 +702,27 @@ mod tests {
 
     #[test]
     fn test_new_defaults_to_claude() {
-        let driver = ClaudeCodeDriver::new(None);
+        let driver = ClaudeCodeDriver::new(None, true);
         assert_eq!(driver.cli_path, "claude");
+        assert!(driver.skip_permissions);
     }
 
     #[test]
     fn test_new_with_custom_path() {
-        let driver = ClaudeCodeDriver::new(Some("/usr/local/bin/claude".to_string()));
+        let driver = ClaudeCodeDriver::new(Some("/usr/local/bin/claude".to_string()), true);
         assert_eq!(driver.cli_path, "/usr/local/bin/claude");
     }
 
     #[test]
     fn test_new_with_empty_path() {
-        let driver = ClaudeCodeDriver::new(Some(String::new()));
+        let driver = ClaudeCodeDriver::new(Some(String::new()), true);
         assert_eq!(driver.cli_path, "claude");
+    }
+
+    #[test]
+    fn test_skip_permissions_disabled() {
+        let driver = ClaudeCodeDriver::new(None, false);
+        assert!(!driver.skip_permissions);
     }
 
     #[test]

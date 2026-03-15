@@ -1,6 +1,21 @@
 // OpenFang Agents Page — Multi-step spawn wizard, detail view with tabs, file editor, personality presets
 'use strict';
 
+/** Escape a string for use inside TOML triple-quoted strings ("""\n...\n""").
+ *  Backslashes are escaped, and runs of 3+ consecutive double-quotes are
+ *  broken up so the TOML parser never sees an unintended closing delimiter.
+ */
+function tomlMultilineEscape(s) {
+  return s.replace(/\\/g, '\\\\').replace(/"""/g, '""\\"');
+}
+
+/** Escape a string for use inside a TOML basic (single-line) string ("...").
+ *  Backslashes, double-quotes, and common control chars are escaped.
+ */
+function tomlBasicEscape(s) {
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
+}
+
 function agentsPage() {
   return {
     tab: 'agents',
@@ -62,6 +77,8 @@ function agentsPage() {
     // -- Model switch --
     editingModel: false,
     newModelValue: '',
+    editingProvider: false,
+    newProviderValue: '',
     modelSaving: false,
     // -- Fallback chain --
     editingFallback: false,
@@ -583,7 +600,7 @@ function agentsPage() {
     },
 
     // ── Multi-step wizard navigation ──
-    openSpawnWizard() {
+    async openSpawnWizard() {
       this.showSpawnModal = true;
       this.spawnStep = 1;
       this.spawnMode = 'wizard';
@@ -591,8 +608,18 @@ function agentsPage() {
       this.selectedPreset = '';
       this.soulContent = '';
       this.spawnForm.name = '';
+      this.spawnForm.provider = 'groq';
+      this.spawnForm.model = 'llama-3.3-70b-versatile';
       this.spawnForm.systemPrompt = 'You are a helpful assistant.';
       this.spawnForm.profile = 'full';
+      try {
+        var res = await fetch('/api/status');
+        if (res.ok) {
+          var status = await res.json();
+          if (status.default_provider) this.spawnForm.provider = status.default_provider;
+          if (status.default_model) this.spawnForm.model = status.default_model;
+        }
+      } catch(e) { /* keep hardcoded defaults */ }
     },
 
     nextStep() {
@@ -616,7 +643,7 @@ function agentsPage() {
       var f = this.spawnForm;
       var si = this.spawnIdentity;
       var lines = [
-        'name = "' + f.name.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"',
+        'name = "' + tomlBasicEscape(f.name) + '"',
         'module = "builtin:chat"'
       ];
       if (f.profile && f.profile !== 'custom') {
@@ -625,7 +652,7 @@ function agentsPage() {
       lines.push('', '[model]');
       lines.push('provider = "' + f.provider + '"');
       lines.push('model = "' + f.model + '"');
-      lines.push('system_prompt = """\n' + f.systemPrompt.replace(/\\/g, '\\\\').replace(/"""/g, '""\\"') + '\n"""');
+      lines.push('system_prompt = """\n' + tomlMultilineEscape(f.systemPrompt) + '\n"""');
       if (f.profile === 'custom') {
         lines.push('', '[capabilities]');
         if (f.caps.memory_read) lines.push('memory_read = ["*"]');
@@ -818,6 +845,26 @@ function agentsPage() {
       this.modelSaving = false;
     },
 
+    // ── Provider switch ──
+    async changeProvider() {
+      if (!this.detailAgent || !this.newProviderValue.trim()) return;
+      this.modelSaving = true;
+      try {
+        var combined = this.newProviderValue.trim() + '/' + this.detailAgent.model_name;
+        var resp = await OpenFangAPI.put('/api/agents/' + this.detailAgent.id + '/model', { model: combined });
+        OpenFangToast.success('Provider changed to ' + (resp && resp.provider ? resp.provider : this.newProviderValue.trim()));
+        this.editingProvider = false;
+        await Alpine.store('app').refreshAgents();
+        var agents = Alpine.store('app').agents;
+        for (var i = 0; i < agents.length; i++) {
+          if (agents[i].id === this.detailAgent.id) { this.detailAgent = agents[i]; break; }
+        }
+      } catch(e) {
+        OpenFangToast.error('Failed to change provider: ' + e.message);
+      }
+      this.modelSaving = false;
+    },
+
     // ── Fallback model chain ──
     async addFallback() {
       if (!this.detailAgent || !this.newFallbackValue.trim()) return;
@@ -903,12 +950,12 @@ function agentsPage() {
     },
 
     async spawnBuiltin(t) {
-      var toml = 'name = "' + t.name + '"\n';
-      toml += 'description = "' + t.description.replace(/"/g, '\\"') + '"\n';
+      var toml = 'name = "' + tomlBasicEscape(t.name) + '"\n';
+      toml += 'description = "' + tomlBasicEscape(t.description) + '"\n';
       toml += 'module = "builtin:chat"\n';
       toml += 'profile = "' + t.profile + '"\n\n';
       toml += '[model]\nprovider = "' + t.provider + '"\nmodel = "' + t.model + '"\n';
-      toml += 'system_prompt = """\n' + t.system_prompt + '\n"""\n';
+      toml += 'system_prompt = """\n' + tomlMultilineEscape(t.system_prompt) + '\n"""\n';
 
       try {
         var res = await OpenFangAPI.post('/api/agents', { manifest_toml: toml });

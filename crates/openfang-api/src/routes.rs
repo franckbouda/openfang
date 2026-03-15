@@ -140,13 +140,19 @@ pub async fn spawn_agent(
 
     let name = manifest.name.clone();
     match state.kernel.spawn_agent(manifest) {
-        Ok(id) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!(SpawnResponse {
-                agent_id: id.to_string(),
-                name,
-            })),
-        ),
+        Ok(id) => {
+            // Register in channel router so binding resolution finds the new agent
+            if let Some(ref mgr) = *state.bridge_manager.lock().await {
+                mgr.router().register_agent(name.clone(), id);
+            }
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!(SpawnResponse {
+                    agent_id: id.to_string(),
+                    name,
+                })),
+            )
+        }
         Err(e) => {
             tracing::warn!("Spawn failed: {e}");
             (
@@ -361,7 +367,7 @@ pub async fn send_message(
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
     match state
         .kernel
-        .send_message_with_handle(agent_id, &req.message, Some(kernel_handle))
+        .send_message_with_handle(agent_id, &req.message, Some(kernel_handle), req.sender_id, req.sender_name)
         .await
     {
         Ok(result) => {
@@ -453,7 +459,7 @@ pub async fn get_agent_session(
                         let mut texts = Vec::new();
                         for b in blocks {
                             match b {
-                                openfang_types::message::ContentBlock::Text { text } => {
+                                openfang_types::message::ContentBlock::Text { text, .. } => {
                                     texts.push(text.clone());
                                 }
                                 openfang_types::message::ContentBlock::Image {
@@ -491,6 +497,7 @@ pub async fn get_agent_session(
                                     id,
                                     name,
                                     input,
+                                    ..
                                 } => {
                                     let tool_idx = tools.len();
                                     tools.push(serde_json::json!({
@@ -851,6 +858,177 @@ pub async fn list_workflow_runs(
     Json(list)
 }
 
+/// GET /api/workflows/:id — Get a single workflow by ID.
+pub async fn get_workflow(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let workflow_id = WorkflowId(match id.parse() {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid workflow ID"})),
+            );
+        }
+    });
+
+    match state.kernel.workflows.get_workflow(workflow_id).await {
+        Some(w) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": w.id.to_string(),
+                "name": w.name,
+                "description": w.description,
+                "steps": w.steps,
+                "created_at": w.created_at.to_rfc3339(),
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Workflow not found"})),
+        ),
+    }
+}
+
+/// PUT /api/workflows/:id — Update a workflow definition.
+pub async fn update_workflow(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let workflow_id = WorkflowId(match id.parse() {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid workflow ID"})),
+            );
+        }
+    });
+
+    let name = req["name"].as_str().unwrap_or("unnamed").to_string();
+    let description = req["description"].as_str().unwrap_or("").to_string();
+
+    let steps_json = match req["steps"].as_array() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing 'steps' array"})),
+            );
+        }
+    };
+
+    let mut steps = Vec::new();
+    for s in steps_json {
+        let step_name = s["name"].as_str().unwrap_or("step").to_string();
+        let agent = if let Some(id) = s["agent_id"].as_str() {
+            StepAgent::ById { id: id.to_string() }
+        } else if let Some(name) = s["agent_name"].as_str() {
+            StepAgent::ByName {
+                name: name.to_string(),
+            }
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({"error": format!("Step '{}' needs 'agent_id' or 'agent_name'", step_name)}),
+                ),
+            );
+        };
+
+        let mode = match s["mode"].as_str().unwrap_or("sequential") {
+            "fan_out" => StepMode::FanOut,
+            "collect" => StepMode::Collect,
+            "conditional" => StepMode::Conditional {
+                condition: s["condition"].as_str().unwrap_or("").to_string(),
+            },
+            "loop" => StepMode::Loop {
+                max_iterations: s["max_iterations"].as_u64().unwrap_or(5) as u32,
+                until: s["until"].as_str().unwrap_or("").to_string(),
+            },
+            _ => StepMode::Sequential,
+        };
+
+        let error_mode = match s["error_mode"].as_str().unwrap_or("fail") {
+            "skip" => ErrorMode::Skip,
+            "retry" => ErrorMode::Retry {
+                max_retries: s["max_retries"].as_u64().unwrap_or(3) as u32,
+            },
+            _ => ErrorMode::Fail,
+        };
+
+        steps.push(WorkflowStep {
+            name: step_name,
+            agent,
+            prompt_template: s["prompt"].as_str().unwrap_or("{{input}}").to_string(),
+            mode,
+            timeout_secs: s["timeout_secs"].as_u64().unwrap_or(120),
+            error_mode,
+            output_var: s["output_var"].as_str().map(String::from),
+        });
+    }
+
+    let updated = Workflow {
+        id: workflow_id,
+        name,
+        description,
+        steps,
+        created_at: chrono::Utc::now(), // preserved by engine
+    };
+
+    if state
+        .kernel
+        .workflows
+        .update_workflow(workflow_id, updated)
+        .await
+    {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "updated", "workflow_id": id})),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Workflow not found"})),
+        )
+    }
+}
+
+/// DELETE /api/workflows/:id — Delete a workflow definition.
+pub async fn delete_workflow(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let workflow_id = WorkflowId(match id.parse() {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid workflow ID"})),
+            );
+        }
+    });
+
+    if state
+        .kernel
+        .workflows
+        .remove_workflow(workflow_id)
+        .await
+    {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "removed", "workflow_id": id})),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Workflow not found"})),
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Trigger routes
 // ---------------------------------------------------------------------------
@@ -1169,7 +1347,7 @@ pub async fn send_message_stream(
     let (rx, _handle) =
         match state
             .kernel
-            .send_message_streaming(agent_id, &req.message, Some(kernel_handle))
+            .send_message_streaming(agent_id, &req.message, Some(kernel_handle), req.sender_id, req.sender_name)
         {
             Ok(pair) => pair,
             Err(e) => {
@@ -1223,7 +1401,9 @@ pub async fn send_message_stream(
         }
     });
 
-    Sse::new(sse_stream).into_response()
+    Sse::new(sse_stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -2851,15 +3031,21 @@ pub async fn delete_agent_kv_key(
 /// Returns only status and version to prevent information leakage.
 /// Use GET /api/health/detail for full diagnostics (requires auth).
 pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // Check database connectivity
-    let shared_id = openfang_types::agent::AgentId(uuid::Uuid::from_bytes([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-    ]));
-    let db_ok = state
-        .kernel
-        .memory
-        .structured_get(shared_id, "__health_check__")
-        .is_ok();
+    // Run the database check on a blocking thread so we never hold the
+    // std::sync::Mutex<Connection> on a tokio worker thread.  This prevents
+    // the health probe from starving the async runtime when the agent loop
+    // is holding the database lock for session saves.
+    let memory = state.kernel.memory.clone();
+    let db_ok = tokio::task::spawn_blocking(move || {
+        let shared_id = openfang_types::agent::AgentId(uuid::Uuid::from_bytes([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]));
+        memory
+            .structured_get(shared_id, "__health_check__")
+            .is_ok()
+    })
+    .await
+    .unwrap_or(false);
 
     let status = if db_ok { "ok" } else { "degraded" };
 
@@ -2873,14 +3059,17 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let health = state.kernel.supervisor.health();
 
-    let shared_id = openfang_types::agent::AgentId(uuid::Uuid::from_bytes([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-    ]));
-    let db_ok = state
-        .kernel
-        .memory
-        .structured_get(shared_id, "__health_check__")
-        .is_ok();
+    let memory = state.kernel.memory.clone();
+    let db_ok = tokio::task::spawn_blocking(move || {
+        let shared_id = openfang_types::agent::AgentId(uuid::Uuid::from_bytes([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]));
+        memory
+            .structured_get(shared_id, "__health_check__")
+            .is_ok()
+    })
+    .await
+    .unwrap_or(false);
 
     let config_warnings = state.kernel.config.validate();
     let status = if db_ok { "ok" } else { "degraded" };
@@ -3182,8 +3371,7 @@ pub async fn clawhub_search(
         Err(e) => {
             let msg = format!("{e}");
             tracing::warn!("ClawHub search failed: {msg}");
-            // Propagate 429 status instead of masking as 200
-            let status = if msg.contains("429") || msg.contains("rate limit") {
+            let status = if is_clawhub_rate_limit(&e) {
                 StatusCode::TOO_MANY_REQUESTS
             } else {
                 StatusCode::OK
@@ -3251,7 +3439,7 @@ pub async fn clawhub_browse(
         Err(e) => {
             let msg = format!("{e}");
             tracing::warn!("ClawHub browse failed: {msg}");
-            let status = if msg.contains("429") || msg.contains("rate limit") {
+            let status = if is_clawhub_rate_limit(&e) {
                 StatusCode::TOO_MANY_REQUESTS
             } else {
                 StatusCode::OK
@@ -3319,10 +3507,14 @@ pub async fn clawhub_skill_detail(
                 })),
             )
         }
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("{e}")})),
-        ),
+        Err(e) => {
+            let status = if is_clawhub_rate_limit(&e) {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            (status, Json(serde_json::json!({"error": format!("{e}")})))
+        }
     }
 }
 
@@ -3423,11 +3615,11 @@ pub async fn clawhub_install(
         }
         Err(e) => {
             let msg = format!("{e}");
-            let status = if msg.contains("SecurityBlocked") {
+            let status = if matches!(e, openfang_skills::SkillError::SecurityBlocked(_)) {
                 StatusCode::FORBIDDEN
-            } else if msg.contains("429") || msg.contains("rate limit") {
+            } else if is_clawhub_rate_limit(&e) {
                 StatusCode::TOO_MANY_REQUESTS
-            } else if msg.contains("Network error") || msg.contains("returned 4") || msg.contains("returned 5") {
+            } else if matches!(e, openfang_skills::SkillError::Network(_)) {
                 StatusCode::BAD_GATEWAY
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -3436,6 +3628,11 @@ pub async fn clawhub_install(
             (status, Json(serde_json::json!({"error": msg})))
         }
     }
+}
+
+/// Check whether a SkillError represents a ClawHub rate-limit (429).
+fn is_clawhub_rate_limit(err: &openfang_skills::SkillError) -> bool {
+    matches!(err, openfang_skills::SkillError::RateLimited(_))
 }
 
 /// Convert a browse entry (nested stats/tags) to a flat JSON object for the frontend.
@@ -3480,7 +3677,10 @@ pub async fn list_hands(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 .hand_registry
                 .check_requirements(&d.id)
                 .unwrap_or_default();
-            let all_satisfied = reqs.iter().all(|(_, ok)| *ok);
+            let readiness = state.kernel.hand_registry.readiness(&d.id);
+            let requirements_met = readiness.as_ref().map(|r| r.requirements_met).unwrap_or(false);
+            let active = readiness.as_ref().map(|r| r.active).unwrap_or(false);
+            let degraded = readiness.as_ref().map(|r| r.degraded).unwrap_or(false);
             serde_json::json!({
                 "id": d.id,
                 "name": d.name,
@@ -3488,11 +3688,14 @@ pub async fn list_hands(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 "category": d.category,
                 "icon": d.icon,
                 "tools": d.tools,
-                "requirements_met": all_satisfied,
+                "requirements_met": requirements_met,
+                "active": active,
+                "degraded": degraded,
                 "requirements": reqs.iter().map(|(r, ok)| serde_json::json!({
                     "key": r.key,
                     "label": r.label,
                     "satisfied": ok,
+                    "optional": r.optional,
                 })).collect::<Vec<_>>(),
                 "dashboard_metrics": d.dashboard.metrics.len(),
                 "has_settings": !d.settings.is_empty(),
@@ -3537,7 +3740,10 @@ pub async fn get_hand(
                 .hand_registry
                 .check_requirements(&hand_id)
                 .unwrap_or_default();
-            let all_satisfied = reqs.iter().all(|(_, ok)| *ok);
+            let readiness = state.kernel.hand_registry.readiness(&hand_id);
+            let requirements_met = readiness.as_ref().map(|r| r.requirements_met).unwrap_or(false);
+            let active = readiness.as_ref().map(|r| r.active).unwrap_or(false);
+            let degraded = readiness.as_ref().map(|r| r.degraded).unwrap_or(false);
             let settings_status = state
                 .kernel
                 .hand_registry
@@ -3552,7 +3758,9 @@ pub async fn get_hand(
                     "category": def.category,
                     "icon": def.icon,
                     "tools": def.tools,
-                    "requirements_met": all_satisfied,
+                    "requirements_met": requirements_met,
+                    "active": active,
+                    "degraded": degraded,
                     "requirements": reqs.iter().map(|(r, ok)| {
                         let mut req_json = serde_json::json!({
                             "key": r.key,
@@ -3560,6 +3768,7 @@ pub async fn get_hand(
                             "type": format!("{:?}", r.requirement_type),
                             "check_value": r.check_value,
                             "satisfied": ok,
+                            "optional": r.optional,
                         });
                         if let Some(ref desc) = r.description {
                             req_json["description"] = serde_json::json!(desc);
@@ -3608,12 +3817,17 @@ pub async fn check_hand_deps(
                 .hand_registry
                 .check_requirements(&hand_id)
                 .unwrap_or_default();
-            let all_satisfied = reqs.iter().all(|(_, ok)| *ok);
+            let readiness = state.kernel.hand_registry.readiness(&hand_id);
+            let requirements_met = readiness.as_ref().map(|r| r.requirements_met).unwrap_or(false);
+            let active = readiness.as_ref().map(|r| r.active).unwrap_or(false);
+            let degraded = readiness.as_ref().map(|r| r.degraded).unwrap_or(false);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "hand_id": def.id,
-                    "requirements_met": all_satisfied,
+                    "requirements_met": requirements_met,
+                    "active": active,
+                    "degraded": degraded,
                     "server_platform": server_platform(),
                     "requirements": reqs.iter().map(|(r, ok)| {
                         let mut req_json = serde_json::json!({
@@ -3622,6 +3836,7 @@ pub async fn check_hand_deps(
                             "type": format!("{:?}", r.requirement_type),
                             "check_value": r.check_value,
                             "satisfied": ok,
+                            "optional": r.optional,
                         });
                         if let Some(ref desc) = r.description {
                             req_json["description"] = serde_json::json!(desc);
@@ -3776,7 +3991,9 @@ pub async fn install_hand_deps(
             let combined = format!("{stdout}{stderr}");
             let likely_ok = combined.contains("already installed")
                 || combined.contains("No applicable update")
-                || combined.contains("No available upgrade");
+                || combined.contains("No available upgrade")
+                || combined.contains("already an App at")
+                || combined.contains("is already installed");
             results.push(serde_json::json!({
                 "key": req.key,
                 "status": if likely_ok { "installed" } else { "error" },
@@ -3896,6 +4113,46 @@ pub async fn install_hand(
         .kernel
         .hand_registry
         .install_from_content(toml_content, skill_content)
+    {
+        Ok(def) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": def.id,
+                "name": def.name,
+                "description": def.description,
+                "category": format!("{:?}", def.category),
+            })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
+/// POST /api/hands/upsert — Install or update a hand definition.
+///
+/// Like `install_hand` but overwrites an existing definition with the same ID.
+/// Active instances are NOT automatically restarted — deactivate + reactivate
+/// to pick up the new definition.
+pub async fn upsert_hand(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let toml_content = body["toml_content"].as_str().unwrap_or("");
+    let skill_content = body["skill_content"].as_str().unwrap_or("");
+
+    if toml_content.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing toml_content field"})),
+        );
+    }
+
+    match state
+        .kernel
+        .hand_registry
+        .upsert_from_content(toml_content, skill_content)
     {
         Ok(def) => (
             StatusCode::OK,
@@ -4126,15 +4383,25 @@ pub async fn hand_stats(
         }
     };
 
-    // Read dashboard metrics from agent's structured memory
+    // Read dashboard metrics from shared structured memory (memory_store uses shared namespace)
+    let shared_id = openfang_kernel::kernel::shared_memory_agent_id();
     let mut metrics = serde_json::Map::new();
     for metric in &def.dashboard.metrics {
+        // Try shared memory first (where memory_store tool writes), fall back to agent-specific
         let value = state
             .kernel
             .memory
-            .structured_get(agent_id, &metric.memory_key)
+            .structured_get(shared_id, &metric.memory_key)
             .ok()
             .flatten()
+            .or_else(|| {
+                state
+                    .kernel
+                    .memory
+                    .structured_get(agent_id, &metric.memory_key)
+                    .ok()
+                    .flatten()
+            })
             .unwrap_or(serde_json::Value::Null);
         metrics.insert(
             metric.label.clone(),
@@ -4538,7 +4805,7 @@ pub async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResp
         && !state.kernel.config.network.shared_secret.is_empty();
 
     let (node_id, listen_address, connected_peers, total_peers) =
-        if let Some(ref peer_node) = state.kernel.peer_node {
+        if let Some(peer_node) = state.kernel.peer_node.get() {
             let registry = peer_node.registry();
             (
                 peer_node.node_id().to_string(),
@@ -5170,7 +5437,8 @@ pub async fn patch_agent(
         }
     }
     if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
-        if let Err(e) = state.kernel.set_agent_model(agent_id, model) {
+        let explicit_provider = body.get("provider").and_then(|v| v.as_str());
+        if let Err(e) = state.kernel.set_agent_model(agent_id, model, explicit_provider) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": format!("{e}")})),
@@ -5607,7 +5875,7 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
 
             // Claude Code CLI: detect binary instead of HTTP probe
             if p.id == "claude-code" {
-                let cli_path = openfang_runtime::drivers::claude_code::ClaudeCodeDriver::new(None).cli_path().to_string();
+                let cli_path = openfang_runtime::drivers::claude_code::ClaudeCodeDriver::new(None, false).cli_path().to_string();
                 let detected = std::path::Path::new(&cli_path).exists()
                     || cli_path != "claude";
                 entry["cli_detected"] = serde_json::json!(detected);
@@ -6442,7 +6710,8 @@ pub async fn set_model(
             )
         }
     };
-    match state.kernel.set_agent_model(agent_id, model) {
+    let explicit_provider = body["provider"].as_str();
+    match state.kernel.set_agent_model(agent_id, model, explicit_provider) {
         Ok(()) => {
             // Return the resolved model+provider so frontend stays in sync.
             // The model name may have been normalized (provider prefix stripped),
@@ -6760,7 +7029,10 @@ pub async fn set_provider_key(
             })
     };
 
-    // Write to secrets.env file
+    // Store in vault (best-effort — no-op if vault not initialized)
+    state.kernel.store_credential(&env_var, &key);
+
+    // Write to secrets.env file (dual-write for backward compat / vault corruption recovery)
     let secrets_path = state.kernel.config.home_dir.join("secrets.env");
     if let Err(e) = write_secret_env(&secrets_path, &env_var, &key) {
         return (
@@ -6822,8 +7094,8 @@ pub async fn set_provider_key(
                 "\n[default_model]\nprovider = \"{}\"\nmodel = \"{}\"\napi_key_env = \"{}\"\n",
                 name, model_id, env_var
             );
+            backup_config(&config_path);
             if let Ok(existing) = std::fs::read_to_string(&config_path) {
-                // Remove existing [default_model] section if present, then append
                 let cleaned = remove_toml_section(&existing, "default_model");
                 let _ = std::fs::write(&config_path, format!("{}\n{}", cleaned.trim(), update_toml));
             } else {
@@ -6922,6 +7194,9 @@ pub async fn delete_provider_key(
         );
     }
 
+    // Remove from vault (best-effort)
+    state.kernel.remove_credential(&env_var);
+
     // Remove from secrets.env
     let secrets_path = state.kernel.config.home_dir.join("secrets.env");
     if let Err(e) = remove_secret_env(&secrets_path, &env_var) {
@@ -7000,6 +7275,7 @@ pub async fn test_provider(
         } else {
             Some(base_url)
         },
+        skip_permissions: true,
     };
 
     match openfang_runtime::drivers::create_driver(&driver_config) {
@@ -7987,7 +8263,7 @@ pub async fn run_schedule(
     );
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
-    match state.kernel.send_message_with_handle(target_agent, &run_message, Some(kernel_handle)).await {
+    match state.kernel.send_message_with_handle(target_agent, &run_message, Some(kernel_handle), None, None).await {
         Ok(result) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -8295,7 +8571,7 @@ pub async fn patch_agent_config(
                     }
                 } else {
                     // Provider is empty string — resolve from catalog
-                    if let Err(e) = state.kernel.set_agent_model(agent_id, new_model) {
+                    if let Err(e) = state.kernel.set_agent_model(agent_id, new_model, None) {
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(serde_json::json!({"error": format!("{e}")})),
@@ -8304,7 +8580,7 @@ pub async fn patch_agent_config(
                 }
             } else {
                 // No provider field at all — resolve from catalog
-                if let Err(e) = state.kernel.set_agent_model(agent_id, new_model) {
+                if let Err(e) = state.kernel.set_agent_model(agent_id, new_model, None) {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({"error": format!("{e}")})),
@@ -8430,6 +8706,11 @@ pub async fn clone_agent(
         .kernel
         .registry
         .update_identity(new_id, source.identity.clone());
+
+    // Register in channel router so binding resolution finds the cloned agent
+    if let Some(ref mgr) = *state.bridge_manager.lock().await {
+        mgr.router().register_agent(req.new_name.clone(), new_id);
+    }
 
     (
         StatusCode::CREATED,
@@ -10068,7 +10349,10 @@ pub async fn copilot_oauth_poll(
             Json(serde_json::json!({"status": "pending"})),
         ),
         openfang_runtime::copilot_oauth::DeviceFlowStatus::Complete { access_token } => {
-            // Save to secrets.env
+            // Store in vault (best-effort)
+            state.kernel.store_credential("GITHUB_TOKEN", &access_token);
+
+            // Save to secrets.env (dual-write)
             let secrets_path = state.kernel.config.home_dir.join("secrets.env");
             if let Err(e) = write_secret_env(&secrets_path, "GITHUB_TOKEN", &access_token) {
                 return (
@@ -10557,7 +10841,7 @@ pub async fn get_providers_health(State(state): State<Arc<AppState>>) -> impl In
         if !p.key_required {
             // Local provider — probe it
             if p.id == "claude-code" {
-                let cli_path = openfang_runtime::drivers::claude_code::ClaudeCodeDriver::new(None).cli_path().to_string();
+                let cli_path = openfang_runtime::drivers::claude_code::ClaudeCodeDriver::new(None, false).cli_path().to_string();
                 let detected = std::path::Path::new(&cli_path).exists();
                 let mut entry = serde_json::json!({
                     "provider": p.id,
@@ -10604,7 +10888,153 @@ pub async fn get_providers_health(State(state): State<Arc<AppState>>) -> impl In
     )
 }
 
+// ── Dashboard Authentication (username/password sessions) ──
+
+/// POST /api/auth/login — Authenticate with username/password, returns session token.
+pub async fn auth_login(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<serde_json::Value>,
+) -> axum::response::Response {
+    use axum::response::Response;
+    use axum::body::Body;
+
+    let auth_cfg = &state.kernel.config.auth;
+    if !auth_cfg.enabled {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({"error": "Auth not enabled"}).to_string()))
+            .unwrap();
+    }
+
+    let username = req.get("username").and_then(|v| v.as_str()).unwrap_or("");
+    let password = req.get("password").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Constant-time username comparison to prevent timing attacks
+    let username_ok = {
+        use subtle::ConstantTimeEq;
+        let stored = auth_cfg.username.as_bytes();
+        let provided = username.as_bytes();
+        if stored.len() != provided.len() {
+            false
+        } else {
+            bool::from(stored.ct_eq(provided))
+        }
+    };
+
+    if !username_ok || !crate::session_auth::verify_password(password, &auth_cfg.password_hash) {
+        // Audit log the failed attempt
+        state.kernel.audit_log.record(
+            "system",
+            openfang_runtime::audit::AuditAction::AuthAttempt,
+            "dashboard login failed",
+            format!("username: {username}"),
+        );
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({"error": "Invalid credentials"}).to_string()))
+            .unwrap();
+    }
+
+    // Derive the session secret the same way as server.rs
+    let api_key = state.kernel.config.api_key.trim().to_string();
+    let secret = if !api_key.is_empty() {
+        api_key
+    } else {
+        auth_cfg.password_hash.clone()
+    };
+
+    let token =
+        crate::session_auth::create_session_token(username, &secret, auth_cfg.session_ttl_hours);
+    let ttl_secs = auth_cfg.session_ttl_hours * 3600;
+    let cookie = format!(
+        "openfang_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={ttl_secs}"
+    );
+
+    state.kernel.audit_log.record(
+        "system",
+        openfang_runtime::audit::AuditAction::AuthAttempt,
+        "dashboard login success",
+        format!("username: {username}"),
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .header("set-cookie", &cookie)
+        .body(Body::from(serde_json::json!({
+            "status": "ok",
+            "token": token,
+            "username": username,
+        }).to_string()))
+        .unwrap()
+}
+
+/// POST /api/auth/logout — Clear the session cookie.
+pub async fn auth_logout() -> impl IntoResponse {
+    let cookie = "openfang_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0";
+    (
+        StatusCode::OK,
+        [("content-type", "application/json"), ("set-cookie", cookie)],
+        serde_json::json!({"status": "ok"}).to_string(),
+    )
+}
+
+/// GET /api/auth/check — Check current authentication state.
+pub async fn auth_check(
+    State(state): State<Arc<AppState>>,
+    request: axum::http::Request<axum::body::Body>,
+) -> impl IntoResponse {
+    let auth_cfg = &state.kernel.config.auth;
+    if !auth_cfg.enabled {
+        return Json(serde_json::json!({
+            "authenticated": true,
+            "mode": "none",
+        }));
+    }
+
+    // Derive the session secret the same way as server.rs
+    let api_key = state.kernel.config.api_key.trim().to_string();
+    let secret = if !api_key.is_empty() {
+        api_key
+    } else {
+        auth_cfg.password_hash.clone()
+    };
+
+    // Check session cookie
+    let session_user = request
+        .headers()
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies
+                .split(';')
+                .find_map(|c| c.trim().strip_prefix("openfang_session=").map(|v| v.to_string()))
+        })
+        .and_then(|token| crate::session_auth::verify_session_token(&token, &secret));
+
+    if let Some(username) = session_user {
+        Json(serde_json::json!({
+            "authenticated": true,
+            "mode": "session",
+            "username": username,
+        }))
+    } else {
+        Json(serde_json::json!({
+            "authenticated": false,
+            "mode": "session",
+        }))
+    }
+}
+
 /// Remove a `[section]` and its contents from a TOML string.
+#[allow(dead_code)]
+fn backup_config(config_path: &std::path::Path) {
+    let backup = config_path.with_extension("toml.bak");
+    let _ = std::fs::copy(config_path, backup);
+}
+
 fn remove_toml_section(content: &str, section: &str) -> String {
     let header = format!("[{}]", section);
     let mut result = String::new();

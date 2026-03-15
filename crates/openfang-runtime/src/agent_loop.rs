@@ -51,6 +51,28 @@ const MAX_CONTINUATIONS: u32 = 5;
 /// Maximum message history size before auto-trimming to prevent context overflow.
 const MAX_HISTORY_MESSAGES: usize = 20;
 
+/// Extra guidance injected after failed tool calls to prevent fabricated follow-up actions.
+const TOOL_ERROR_GUIDANCE: &str =
+    "[System: One or more tool calls failed. Failed tools did not produce usable data. Do NOT invent missing results, cite nonexistent search results, or pretend failed tools succeeded. If your next steps depend on a failed tool, either retry with a materially different approach or explain the failure to the user and stop. Do not write files, store memory, or take downstream actions based on failed tool outputs.]";
+
+fn append_tool_error_guidance(tool_result_blocks: &mut Vec<ContentBlock>) {
+    let has_tool_error = tool_result_blocks.iter().any(|block| {
+        matches!(
+            block,
+            ContentBlock::ToolResult {
+                is_error: true,
+                ..
+            }
+        )
+    });
+    if has_tool_error {
+        tool_result_blocks.push(ContentBlock::Text {
+            text: TOOL_ERROR_GUIDANCE.to_string(),
+            provider_metadata: None,
+        });
+    }
+}
+
 /// Strip a provider prefix from a model ID before sending to the API.
 ///
 /// Many models are stored as `provider/org/model` (e.g. `openrouter/google/gemini-2.5-flash`)
@@ -365,6 +387,7 @@ pub async fn run_agent_loop(
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         input: tc.input.clone(),
+                        provider_metadata: None,
                     });
                 }
                 response.content = new_blocks;
@@ -388,7 +411,8 @@ pub async fn run_agent_loop(
                         .messages
                         .push(Message::assistant("[no reply needed]".to_string()));
                     memory
-                        .save_session(session)
+                        .save_session_async(session)
+                        .await
                         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
                     return Ok(AgentLoopResult {
                         response: String::new(),
@@ -456,7 +480,8 @@ pub async fn run_agent_loop(
 
                 // Save session
                 memory
-                    .save_session(session)
+                    .save_session_async(session)
+                    .await
                     .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
                 // Remember this interaction (with embedding if available)
@@ -570,7 +595,7 @@ pub async fn run_agent_loop(
                         LoopGuardVerdict::CircuitBreak(msg) => {
                             warn!(tool = %tool_call.name, "Circuit breaker triggered");
                             // Save session before bailing
-                            if let Err(e) = memory.save_session(session) {
+                            if let Err(e) = memory.save_session_async(session).await {
                                 warn!("Failed to save session on circuit break: {e}");
                             }
                             // Fire AgentLoopEnd hook on circuit break
@@ -720,6 +745,8 @@ pub async fn run_agent_loop(
                     });
                 }
 
+                append_tool_error_guidance(&mut tool_result_blocks);
+
                 // Detect approval denials and inject guidance to prevent infinite retry loops
                 let denial_count = tool_result_blocks.iter().filter(|b| {
                     matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
@@ -730,9 +757,13 @@ pub async fn run_agent_loop(
                         text: format!(
                             "[System: {} tool call(s) were denied by approval policy. \
                              Do NOT retry denied tools. Explain to the user what you \
-                             wanted to do and that it requires their approval.]",
+                             wanted to do and that it requires their approval. \
+                             Hint: set auto_approve = true in [approval] section of \
+                             config.toml, or start with --yolo flag, to auto-approve \
+                             all tool calls.]",
                             denial_count
                         ),
+                        provider_metadata: None,
                     });
                 }
 
@@ -750,6 +781,7 @@ pub async fn run_agent_loop(
                              alternatives instead of making up data.]",
                             non_denial_errors
                         ),
+                        provider_metadata: None,
                     });
                 }
 
@@ -762,7 +794,7 @@ pub async fn run_agent_loop(
                 messages.push(tool_results_msg);
 
                 // Interim save after tool execution to prevent data loss on crash
-                if let Err(e) = memory.save_session(session) {
+                if let Err(e) = memory.save_session_async(session).await {
                     warn!("Failed to interim-save session: {e}");
                 }
             }
@@ -777,7 +809,7 @@ pub async fn run_agent_loop(
                         text
                     };
                     session.messages.push(Message::assistant(&text));
-                    if let Err(e) = memory.save_session(session) {
+                    if let Err(e) = memory.save_session_async(session).await {
                         warn!("Failed to save session on max continuations: {e}");
                     }
                     warn!(
@@ -819,7 +851,7 @@ pub async fn run_agent_loop(
     }
 
     // Save session before failing so conversation history is preserved
-    if let Err(e) = memory.save_session(session) {
+    if let Err(e) = memory.save_session_async(session).await {
         warn!("Failed to save session on max iterations: {e}");
     }
 
@@ -920,7 +952,11 @@ async fn call_with_retry(
             Err(e) => {
                 // Use classifier for smarter error handling
                 let raw_error = e.to_string();
-                let classified = llm_errors::classify_error(&raw_error, None);
+                let status = match &e {
+                    LlmError::Api { status, .. } => Some(*status),
+                    _ => None,
+                };
+                let classified = llm_errors::classify_error(&raw_error, status);
                 warn!(
                     category = ?classified.category,
                     retryable = classified.is_retryable,
@@ -1030,7 +1066,11 @@ async fn stream_with_retry(
             }
             Err(e) => {
                 let raw_error = e.to_string();
-                let classified = llm_errors::classify_error(&raw_error, None);
+                let status = match &e {
+                    LlmError::Api { status, .. } => Some(*status),
+                    _ => None,
+                };
+                let classified = llm_errors::classify_error(&raw_error, status);
                 warn!(
                     category = ?classified.category,
                     retryable = classified.is_retryable,
@@ -1290,9 +1330,15 @@ pub async fn run_agent_loop_streaming(
             thinking: None,
         };
 
-        // Notify phase: Streaming (streaming variant always streams)
+        // Notify phase: on first iteration emit Streaming; on subsequent
+        // iterations (after tool execution) emit Thinking so the UI shows
+        // "Thinking..." instead of overwriting streamed text with "streaming".
         if let Some(cb) = on_phase {
-            cb(LoopPhase::Streaming);
+            if iteration == 0 {
+                cb(LoopPhase::Streaming);
+            } else {
+                cb(LoopPhase::Thinking);
+            }
         }
 
         // Stream LLM call with retry, error classification, and circuit breaker
@@ -1329,6 +1375,7 @@ pub async fn run_agent_loop_streaming(
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         input: tc.input.clone(),
+                        provider_metadata: None,
                     });
                 }
                 response.content = new_blocks;
@@ -1351,7 +1398,8 @@ pub async fn run_agent_loop_streaming(
                         .messages
                         .push(Message::assistant("[no reply needed]".to_string()));
                     memory
-                        .save_session(session)
+                        .save_session_async(session)
+                        .await
                         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
                     return Ok(AgentLoopResult {
                         response: String::new(),
@@ -1418,7 +1466,8 @@ pub async fn run_agent_loop_streaming(
                 crate::session_repair::prune_heartbeat_turns(&mut session.messages, 10);
 
                 memory
-                    .save_session(session)
+                    .save_session_async(session)
+                    .await
                     .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
                 // Remember this interaction (with embedding if available)
@@ -1528,7 +1577,7 @@ pub async fn run_agent_loop_streaming(
                     match &verdict {
                         LoopGuardVerdict::CircuitBreak(msg) => {
                             warn!(tool = %tool_call.name, "Circuit breaker triggered (streaming)");
-                            if let Err(e) = memory.save_session(session) {
+                            if let Err(e) = memory.save_session_async(session).await {
                                 warn!("Failed to save session on circuit break: {e}");
                             }
                             // Fire AgentLoopEnd hook on circuit break
@@ -1692,6 +1741,8 @@ pub async fn run_agent_loop_streaming(
                     });
                 }
 
+                append_tool_error_guidance(&mut tool_result_blocks);
+
                 // Detect approval denials and inject guidance to prevent infinite retry loops
                 let denial_count = tool_result_blocks.iter().filter(|b| {
                     matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
@@ -1702,9 +1753,13 @@ pub async fn run_agent_loop_streaming(
                         text: format!(
                             "[System: {} tool call(s) were denied by approval policy. \
                              Do NOT retry denied tools. Explain to the user what you \
-                             wanted to do and that it requires their approval.]",
+                             wanted to do and that it requires their approval. \
+                             Hint: set auto_approve = true in [approval] section of \
+                             config.toml, or start with --yolo flag, to auto-approve \
+                             all tool calls.]",
                             denial_count
                         ),
+                        provider_metadata: None,
                     });
                 }
 
@@ -1722,6 +1777,7 @@ pub async fn run_agent_loop_streaming(
                              alternatives instead of making up data.]",
                             non_denial_errors
                         ),
+                        provider_metadata: None,
                     });
                 }
 
@@ -1732,7 +1788,7 @@ pub async fn run_agent_loop_streaming(
                 session.messages.push(tool_results_msg.clone());
                 messages.push(tool_results_msg);
 
-                if let Err(e) = memory.save_session(session) {
+                if let Err(e) = memory.save_session_async(session).await {
                     warn!("Failed to interim-save session: {e}");
                 }
             }
@@ -1746,7 +1802,7 @@ pub async fn run_agent_loop_streaming(
                         text
                     };
                     session.messages.push(Message::assistant(&text));
-                    if let Err(e) = memory.save_session(session) {
+                    if let Err(e) = memory.save_session_async(session).await {
                         warn!("Failed to save session on max continuations: {e}");
                     }
                     warn!(
@@ -1786,7 +1842,7 @@ pub async fn run_agent_loop_streaming(
         }
     }
 
-    if let Err(e) = memory.save_session(session) {
+    if let Err(e) = memory.save_session_async(session).await {
         warn!("Failed to save session on max iterations: {e}");
     }
 
@@ -1819,6 +1875,11 @@ pub async fn run_agent_loop_streaming(
 /// 6. `[TOOL_CALL]...[/TOOL_CALL]` blocks (JSON or arrow syntax) — issue #354
 /// 7. `<tool_call>{"name":"tool","arguments":{...}}</tool_call>` — Qwen3, issue #332
 /// 8. Bare JSON `{"name":"tool","arguments":{...}}` objects (last resort, only if no tags found)
+/// 9. `<function name="tool" parameters="{...}" />` — XML attribute style (Groq/Llama)
+/// 10. `<|plugin|>...<|endofblock|>` — Qwen/ChatGLM thinking-model format
+/// 11. `Action: tool\nAction Input: {"key":"value"}` — ReAct-style (LM Studio, GPT-OSS)
+/// 12. `tool_name\n{"key":"value"}` — bare name + JSON on next line (Llama 4 Scout)
+/// 13. `<tool_use>{"name":"tool","arguments":{...}}</tool_use>` — Llama 3.1+ variant
 ///
 /// Validates tool names against available tools and returns synthetic `ToolCall` entries.
 fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Vec<ToolCall> {
@@ -2145,6 +2206,168 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
                     tool = tool_name.as_str(),
                     "Recovered tool call from <tool_call> block"
                 );
+                calls.push(ToolCall {
+                    id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                    name: tool_name,
+                    input,
+                });
+            }
+        }
+    }
+
+    // Pattern 9: <function name="tool" parameters="{...}" /> — XML attribute style
+    // Groq/Llama sometimes emit self-closing XML with name/parameters attributes.
+    // The parameters value is HTML-entity-escaped JSON (&quot; etc.).
+    {
+        use regex_lite::Regex;
+        // Match both self-closing <function ... /> and <function ...></function>
+        let re = Regex::new(
+            r#"<function\s+name="([^"]+)"\s+parameters="([^"]*)"[^/]*/?>"#
+        ).unwrap();
+        for caps in re.captures_iter(text) {
+            let tool_name = caps.get(1).unwrap().as_str();
+            let raw_params = caps.get(2).unwrap().as_str();
+
+            if !tool_names.contains(&tool_name) {
+                warn!(tool = tool_name, "XML-attribute tool call for unknown tool — skipping");
+                continue;
+            }
+
+            // Unescape HTML entities (&quot; &amp; &lt; &gt; &apos;)
+            let unescaped = raw_params
+                .replace("&quot;", "\"")
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&apos;", "'");
+
+            let input: serde_json::Value = match serde_json::from_str(&unescaped) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(tool = tool_name, error = %e, "Failed to parse XML-attribute tool call params — skipping");
+                    continue;
+                }
+            };
+
+            if calls.iter().any(|c| c.name == tool_name && c.input == input) {
+                continue;
+            }
+
+            info!(tool = tool_name, "Recovered XML-attribute tool call → synthetic ToolUse");
+            calls.push(ToolCall {
+                id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                name: tool_name.to_string(),
+                input,
+            });
+        }
+    }
+
+    // Pattern 10: <|plugin|>...<|endofblock|> (Qwen/ChatGLM thinking-model format)
+    search_from = 0;
+    while let Some(start) = text[search_from..].find("<|plugin|>") {
+        let abs_start = search_from + start;
+        let after_tag = abs_start + "<|plugin|>".len();
+
+        let close_tag = "<|endofblock|>";
+        let Some(close_offset) = text[after_tag..].find(close_tag) else {
+            search_from = after_tag;
+            continue;
+        };
+        let inner = text[after_tag..after_tag + close_offset].trim();
+        search_from = after_tag + close_offset + close_tag.len();
+
+        if let Some((tool_name, input)) = parse_json_tool_call_object(inner, &tool_names) {
+            if !calls.iter().any(|c| c.name == tool_name && c.input == input) {
+                info!(tool = tool_name.as_str(), "Recovered tool call from <|plugin|> block");
+                calls.push(ToolCall {
+                    id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                    name: tool_name,
+                    input,
+                });
+            }
+        }
+    }
+
+    // Pattern 11: Action: tool_name\nAction Input: {JSON} (ReAct-style, LM Studio / GPT-OSS)
+    {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i].trim();
+            if let Some(tool_part) = line.strip_prefix("Action:").or_else(|| line.strip_prefix("action:")) {
+                let tool_name = tool_part.trim();
+                if tool_names.contains(&tool_name) {
+                    // Look for "Action Input:" on the next line(s)
+                    if i + 1 < lines.len() {
+                        let next = lines[i + 1].trim();
+                        if let Some(json_part) = next.strip_prefix("Action Input:").or_else(|| next.strip_prefix("action input:")).or_else(|| next.strip_prefix("action_input:")) {
+                            let json_str = json_part.trim();
+                            if let Ok(input) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                if !calls.iter().any(|c| c.name == tool_name && c.input == input) {
+                                    info!(tool = tool_name, "Recovered tool call from Action/Action Input pattern");
+                                    calls.push(ToolCall {
+                                        id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                                        name: tool_name.to_string(),
+                                        input,
+                                    });
+                                }
+                            }
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // Pattern 12: tool_name\n{"key":"value"} — bare name + JSON on next line (Llama 4 Scout)
+    {
+        let lines: Vec<&str> = text.lines().collect();
+        for i in 0..lines.len().saturating_sub(1) {
+            let name_line = lines[i].trim();
+            // Tool name must be a single word matching a known tool
+            if name_line.contains(' ') || name_line.contains('{') || name_line.is_empty() {
+                continue;
+            }
+            if !tool_names.contains(&name_line) {
+                continue;
+            }
+            // Next line must be valid JSON
+            let json_line = lines[i + 1].trim();
+            if !json_line.starts_with('{') {
+                continue;
+            }
+            if let Ok(input) = serde_json::from_str::<serde_json::Value>(json_line) {
+                if !calls.iter().any(|c| c.name == name_line && c.input == input) {
+                    info!(tool = name_line, "Recovered tool call from name+JSON line pair");
+                    calls.push(ToolCall {
+                        id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                        name: name_line.to_string(),
+                        input,
+                    });
+                }
+            }
+        }
+    }
+
+    // Pattern 13: <tool_use>JSON</tool_use> (Llama 3.1+ variant)
+    search_from = 0;
+    while let Some(start) = text[search_from..].find("<tool_use>") {
+        let abs_start = search_from + start;
+        let after_tag = abs_start + "<tool_use>".len();
+
+        let Some(close_offset) = text[after_tag..].find("</tool_use>") else {
+            search_from = after_tag;
+            continue;
+        };
+        let inner = text[after_tag..after_tag + close_offset].trim();
+        search_from = after_tag + close_offset + "</tool_use>".len();
+
+        if let Some((tool_name, input)) = parse_json_tool_call_object(inner, &tool_names) {
+            if !calls.iter().any(|c| c.name == tool_name && c.input == input) {
+                info!(tool = tool_name.as_str(), "Recovered tool call from <tool_use> block");
                 calls.push(ToolCall {
                     id: format!("recovered_{}", uuid::Uuid::new_v4()),
                     name: tool_name,
@@ -2521,6 +2744,7 @@ mod tests {
                         id: "tool_1".to_string(),
                         name: "fake_tool".to_string(),
                         input: serde_json::json!({"query": "test"}),
+                        provider_metadata: None,
                     }],
                     stop_reason: StopReason::ToolUse,
                     tool_calls: vec![ToolCall {
@@ -2582,6 +2806,7 @@ mod tests {
             Ok(CompletionResponse {
                 content: vec![ContentBlock::Text {
                     text: "Hello from the agent!".to_string(),
+                    provider_metadata: None,
                 }],
                 stop_reason: StopReason::EndTurn,
                 tool_calls: vec![],
@@ -2643,6 +2868,58 @@ mod tests {
             result.response.contains("Task completed"),
             "Expected fallback message, got: {:?}",
             result.response
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_error_injects_no_fabrication_guidance() {
+        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let mut session = openfang_memory::session::Session {
+            id: openfang_types::agent::SessionId::new(),
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        };
+        let manifest = test_manifest();
+        let driver: Arc<dyn LlmDriver> = Arc::new(EmptyAfterToolUseDriver::new());
+
+        run_agent_loop(
+            &manifest,
+            "Do something with tools",
+            &mut session,
+            &memory,
+            driver,
+            &[], // no tools registered — the tool call will fail, which is fine
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // on_phase
+            None, // media_engine
+            None, // tts_engine
+            None, // docker_config
+            None, // hooks
+            None, // context_window_tokens
+            None, // process_manager
+        )
+        .await
+        .expect("Loop should complete without error");
+
+        let guidance_seen = session.messages.iter().any(|msg| match &msg.content {
+            MessageContent::Blocks(blocks) => blocks.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text } if text == TOOL_ERROR_GUIDANCE)
+            }),
+            _ => false,
+        });
+
+        assert!(
+            guidance_seen,
+            "Expected tool error guidance in session messages after failed tool call"
         );
     }
 
@@ -2834,6 +3111,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text {
                         text: "Recovered after retry!".to_string(),
+                        provider_metadata: None,
                     }],
                     stop_reason: StopReason::EndTurn,
                     tool_calls: vec![],
@@ -3576,6 +3854,158 @@ mod tests {
         assert_eq!(calls[0].input["command"], "ls");
     }
 
+    // --- Pattern 9: XML-attribute style <function name="..." parameters="..." /> ---
+
+    #[test]
+    fn test_recover_xml_attribute_basic() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = r#"<function name="web_search" parameters="{&quot;query&quot;: &quot;best crypto 2024&quot;}" />"#;
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].input["query"], "best crypto 2024");
+    }
+
+    #[test]
+    fn test_recover_xml_attribute_unknown_tool() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = r#"<function name="unknown_tool" parameters="{&quot;x&quot;: 1}" />"#;
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_recover_xml_attribute_non_selfclosing() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = r#"<function name="shell_exec" parameters="{&quot;command&quot;: &quot;ls&quot;}"></function>"#;
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+    }
+
+    // --- Pattern 10: <|plugin|>...<|endofblock|> tests ---
+
+    #[test]
+    fn test_recover_plugin_block() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = "<|plugin|>\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"rust\"}}\n<|endofblock|>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].input["query"], "rust");
+    }
+
+    #[test]
+    fn test_recover_plugin_block_unknown_tool() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = "<|plugin|>\n{\"name\": \"hack\", \"arguments\": {\"cmd\": \"rm\"}}\n<|endofblock|>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    // --- Pattern 11: Action/Action Input tests ---
+
+    #[test]
+    fn test_recover_action_input() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = "Action: web_search\nAction Input: {\"query\": \"rust programming\"}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].input["query"], "rust programming");
+    }
+
+    #[test]
+    fn test_recover_action_input_unknown_tool() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = "Action: unknown_tool\nAction Input: {\"key\": \"value\"}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    // --- Pattern 12: name + JSON on next line tests ---
+
+    #[test]
+    fn test_recover_name_json_nextline() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = "shell_exec\n{\"command\": \"ls -la\"}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(calls[0].input["command"], "ls -la");
+    }
+
+    #[test]
+    fn test_recover_name_json_nextline_unknown() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = "unknown_tool\n{\"command\": \"ls\"}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    // --- Pattern 13: <tool_use> tests ---
+
+    #[test]
+    fn test_recover_tool_use_block() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = "<tool_use>{\"name\": \"web_search\", \"arguments\": {\"query\": \"test\"}}</tool_use>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+    }
+
+    #[test]
+    fn test_recover_tool_use_block_unknown() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = "<tool_use>{\"name\": \"hack\", \"arguments\": {\"cmd\": \"rm\"}}</tool_use>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
     // --- Helper function tests ---
 
     #[test]
@@ -3662,6 +4092,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text {
                         text: r#"Let me search for that. <function=web_search>{"query":"rust async"}</function>"#.to_string(),
+                        provider_metadata: None,
                     }],
                     stop_reason: StopReason::EndTurn,
                     tool_calls: vec![], // BUG: no tool_calls!
@@ -3675,6 +4106,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text {
                         text: "Based on the search results, Rust async is great!".to_string(),
+                        provider_metadata: None,
                     }],
                     stop_reason: StopReason::EndTurn,
                     tool_calls: vec![],
