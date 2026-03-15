@@ -2906,13 +2906,14 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Loop should complete without error");
 
         let guidance_seen = session.messages.iter().any(|msg| match &msg.content {
             MessageContent::Blocks(blocks) => blocks.iter().any(|block| {
-                matches!(block, ContentBlock::Text { text } if text == TOOL_ERROR_GUIDANCE)
+                matches!(block, ContentBlock::Text { text, .. } if text == TOOL_ERROR_GUIDANCE)
             }),
             _ => false,
         });
