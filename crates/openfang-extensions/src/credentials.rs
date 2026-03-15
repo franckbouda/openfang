@@ -252,7 +252,10 @@ pub fn migrate_dotenv_to_vault(
 /// Detect if a value looks like a raw API key (not an env var name).
 fn looks_like_raw_api_key(value: &str) -> bool {
     // Valid env var names are ALL_CAPS with digits and underscores only
-    if value.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    {
         return false;
     }
     // Known API key prefixes
@@ -346,7 +349,10 @@ pub fn migrate_config_to_vault(
                         }
 
                         // Store in vault
-                        vault.set(vault_key.clone(), zeroize::Zeroizing::new(value.to_string()))?;
+                        vault.set(
+                            vault_key.clone(),
+                            zeroize::Zeroizing::new(value.to_string()),
+                        )?;
 
                         // Build the masked comment + replacement line
                         let masked = mask_token(value);
@@ -357,10 +363,8 @@ pub fn migrate_config_to_vault(
                         );
 
                         // Preserve leading whitespace from original line
-                        let indent: String = line
-                            .chars()
-                            .take_while(|c| c.is_whitespace())
-                            .collect();
+                        let indent: String =
+                            line.chars().take_while(|c| c.is_whitespace()).collect();
 
                         new_lines.push(format!("{}{}", indent, comment));
                         new_lines.push(format!("{}{} = \"{}\"", indent, field, vault_key));
@@ -640,7 +644,12 @@ api_key_env = "gsk_testkey1234567890abcdefghijklmnopqrstuvwxyz"
         use rand::RngCore;
         OsRng.fill_bytes(key.as_mut());
         vault.init_with_key(key).unwrap();
-        vault.set("GROQ_API_KEY".to_string(), Zeroizing::new("existing".to_string())).unwrap();
+        vault
+            .set(
+                "GROQ_API_KEY".to_string(),
+                Zeroizing::new("existing".to_string()),
+            )
+            .unwrap();
 
         let migrated = migrate_config_to_vault(&config_path, &mut vault).unwrap();
         assert!(migrated.is_empty());

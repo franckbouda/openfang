@@ -135,11 +135,9 @@ pub fn validate_and_repair_with_stats(messages: &[Message]) -> (Vec<Message>, Re
             for block in blocks.iter_mut() {
                 if let ContentBlock::ToolResult { content, .. } = block {
                     if content.len() > MAX_TOOL_RESULT_BYTES {
-                        let safe = crate::str_utils::safe_truncate_str(content, MAX_TOOL_RESULT_BYTES);
-                        *content = format!(
-                            "{}\n[Content truncated: exceeded 512KB limit]",
-                            safe
-                        );
+                        let safe =
+                            crate::str_utils::safe_truncate_str(content, MAX_TOOL_RESULT_BYTES);
+                        *content = format!("{}\n[Content truncated: exceeded 512KB limit]", safe);
                         warn!(
                             original_len = content.len(),
                             "Truncated oversized ToolResult content to 512KB"
@@ -211,7 +209,10 @@ pub fn validate_and_repair_with_stats(messages: &[Message]) -> (Vec<Message>, Re
         final_messages.push(msg);
     }
     if alternation_fixed > 0 {
-        debug!(count = alternation_fixed, "Fixed post-merge alternation violations");
+        debug!(
+            count = alternation_fixed,
+            "Fixed post-merge alternation violations"
+        );
     }
 
     if stats != RepairStats::default() {
@@ -399,11 +400,13 @@ fn insert_synthetic_results(messages: &mut Vec<Message>) -> usize {
         if msg.role == Role::Assistant {
             if let MessageContent::Blocks(blocks) = &msg.content {
                 for block in blocks {
-                    if let ContentBlock::ToolUse { id, name, input, .. } = block {
+                    if let ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } = block
+                    {
                         if !existing_result_ids.contains(id) {
                             // Summarise the input so the LLM knows what was being called
-                            let input_str = serde_json::to_string(input)
-                                .unwrap_or_default();
+                            let input_str = serde_json::to_string(input).unwrap_or_default();
                             // Truncate long inputs to keep the synthetic message small
                             let input_summary = if input_str.len() > 200 {
                                 format!("{}…", &input_str[..200])
@@ -745,7 +748,10 @@ fn merge_content(dst: &mut MessageContent, src: MessageContent) {
 /// Convert MessageContent to a Vec<ContentBlock>.
 fn content_to_blocks(content: MessageContent) -> Vec<ContentBlock> {
     match content {
-        MessageContent::Text(s) => vec![ContentBlock::Text { text: s, provider_metadata: None }],
+        MessageContent::Text(s) => vec![ContentBlock::Text {
+            text: s,
+            provider_metadata: None,
+        }],
         MessageContent::Blocks(blocks) => blocks,
     }
 }

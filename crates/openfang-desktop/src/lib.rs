@@ -14,7 +14,8 @@ use openfang_kernel::OpenFangKernel;
 use openfang_types::event::{EventPayload, LifecycleEvent, SystemEvent};
 use std::sync::Arc;
 use std::time::Instant;
-#[allow(unused_imports)] // Manager is used via get_webview_window — rustc doesn't detect it as "used"
+#[allow(unused_imports)]
+// Manager is used via get_webview_window — rustc doesn't detect it as "used"
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_notification::NotificationExt;
 use tracing::{info, warn};

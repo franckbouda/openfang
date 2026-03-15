@@ -260,9 +260,11 @@ impl LlmDriver for OpenAIDriver {
                                 has_tool_results = true;
                                 oai_messages.push(OaiMessage {
                                     role: "tool".to_string(),
-                                    content: Some(OaiMessageContent::Text(
-                                        if content.is_empty() { "(empty)".to_string() } else { content.clone() }
-                                    )),
+                                    content: Some(OaiMessageContent::Text(if content.is_empty() {
+                                        "(empty)".to_string()
+                                    } else {
+                                        content.clone()
+                                    })),
                                     tool_calls: None,
                                     tool_call_id: Some(tool_use_id.clone()),
                                     reasoning_content: None,
@@ -298,7 +300,9 @@ impl LlmDriver for OpenAIDriver {
                     for block in blocks {
                         match block {
                             ContentBlock::Text { text, .. } => text_parts.push(text.clone()),
-                            ContentBlock::ToolUse { id, name, input, .. } => {
+                            ContentBlock::ToolUse {
+                                id, name, input, ..
+                            } => {
                                 tool_calls.push(OaiToolCall {
                                     id: id.clone(),
                                     call_type: "function".to_string(),
@@ -334,7 +338,9 @@ impl LlmDriver for OpenAIDriver {
                             Some(tool_calls)
                         },
                         tool_call_id: None,
-                        reasoning_content: if has_tool_calls && self.kimi_needs_reasoning_content(&request.model) {
+                        reasoning_content: if has_tool_calls
+                            && self.kimi_needs_reasoning_content(&request.model)
+                        {
                             Some(String::new())
                         } else {
                             None
@@ -486,9 +492,16 @@ impl LlmDriver for OpenAIDriver {
 
                 // Auto-cap max_tokens when model rejects our value (e.g. Groq Maverick limit 8192)
                 if status == 400 && body.contains("max_tokens") && attempt < max_retries {
-                    let current = oai_request.max_tokens.or(oai_request.max_completion_tokens).unwrap_or(4096);
+                    let current = oai_request
+                        .max_tokens
+                        .or(oai_request.max_completion_tokens)
+                        .unwrap_or(4096);
                     let cap = extract_max_tokens_limit(&body).unwrap_or(current / 2);
-                    warn!(old = current, new = cap, "Auto-capping max_tokens to model limit");
+                    warn!(
+                        old = current,
+                        new = cap,
+                        "Auto-capping max_tokens to model limit"
+                    );
                     if oai_request.max_completion_tokens.is_some() {
                         oai_request.max_completion_tokens = Some(cap);
                     } else {
@@ -545,7 +558,10 @@ impl LlmDriver for OpenAIDriver {
             // (DeepSeek-R1, Qwen3, etc. via LM Studio/Ollama)
             if let Some(ref reasoning) = choice.message.reasoning_content {
                 if !reasoning.is_empty() {
-                    debug!(len = reasoning.len(), "Captured reasoning_content from response");
+                    debug!(
+                        len = reasoning.len(),
+                        "Captured reasoning_content from response"
+                    );
                     content.push(ContentBlock::Thinking {
                         thinking: reasoning.clone(),
                     });
@@ -566,7 +582,10 @@ impl LlmDriver for OpenAIDriver {
                         }
                     }
                     if !cleaned.is_empty() {
-                        content.push(ContentBlock::Text { text: cleaned, provider_metadata: None });
+                        content.push(ContentBlock::Text {
+                            text: cleaned,
+                            provider_metadata: None,
+                        });
                     }
                 }
             }
@@ -574,28 +593,41 @@ impl LlmDriver for OpenAIDriver {
             // If we have reasoning but no text content and no tool calls,
             // synthesize a brief text block so the agent loop doesn't treat
             // this as an empty response.
-            let has_text = content.iter().any(|b| matches!(b, ContentBlock::Text { .. }));
-            let has_thinking = content.iter().any(|b| matches!(b, ContentBlock::Thinking { .. }));
+            let has_text = content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { .. }));
+            let has_thinking = content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Thinking { .. }));
             if has_thinking && !has_text && choice.message.tool_calls.is_none() {
                 // Extract the last sentence or line from the thinking as a response
-                let thinking_text = content.iter().find_map(|b| match b {
-                    ContentBlock::Thinking { thinking } => Some(thinking.as_str()),
-                    _ => None,
-                }).unwrap_or("");
+                let thinking_text = content
+                    .iter()
+                    .find_map(|b| match b {
+                        ContentBlock::Thinking { thinking } => Some(thinking.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
                 let summary = extract_thinking_summary(thinking_text);
-                debug!(summary_len = summary.len(), "Synthesizing text from thinking-only response");
-                content.push(ContentBlock::Text { text: summary, provider_metadata: None });
+                debug!(
+                    summary_len = summary.len(),
+                    "Synthesizing text from thinking-only response"
+                );
+                content.push(ContentBlock::Text {
+                    text: summary,
+                    provider_metadata: None,
+                });
             }
 
             if let Some(calls) = choice.message.tool_calls {
                 for call in calls {
-                    let input: serde_json::Value =
-                        serde_json::from_str(&call.function.arguments).map_err(|e| {
-                            LlmError::Parse(format!(
-                                "Invalid tool arguments for '{}': {}",
-                                call.function.name, e
-                            ))
-                        })?;
+                    let input: serde_json::Value = serde_json::from_str(&call.function.arguments)
+                        .map_err(|e| {
+                        LlmError::Parse(format!(
+                            "Invalid tool arguments for '{}': {}",
+                            call.function.name, e
+                        ))
+                    })?;
                     content.push(ContentBlock::ToolUse {
                         id: call.id.clone(),
                         name: call.function.name.clone(),
@@ -636,7 +668,9 @@ impl LlmDriver for OpenAIDriver {
             // non-zero output_tokens so the agent loop doesn't misclassify
             // this as a "silent failure" and loop unnecessarily.
             if !content.is_empty() && usage.input_tokens == 0 && usage.output_tokens == 0 {
-                debug!("Response has content but no usage stats — setting synthetic output_tokens=1");
+                debug!(
+                    "Response has content but no usage stats — setting synthetic output_tokens=1"
+                );
                 usage.output_tokens = 1;
             }
 
@@ -713,9 +747,11 @@ impl LlmDriver for OpenAIDriver {
                         {
                             oai_messages.push(OaiMessage {
                                 role: "tool".to_string(),
-                                content: Some(OaiMessageContent::Text(
-                                    if content.is_empty() { "(empty)".to_string() } else { content.clone() }
-                                )),
+                                content: Some(OaiMessageContent::Text(if content.is_empty() {
+                                    "(empty)".to_string()
+                                } else {
+                                    content.clone()
+                                })),
                                 tool_calls: None,
                                 tool_call_id: Some(tool_use_id.clone()),
                                 reasoning_content: None,
@@ -729,7 +765,9 @@ impl LlmDriver for OpenAIDriver {
                     for block in blocks {
                         match block {
                             ContentBlock::Text { text, .. } => text_parts.push(text.clone()),
-                            ContentBlock::ToolUse { id, name, input, .. } => {
+                            ContentBlock::ToolUse {
+                                id, name, input, ..
+                            } => {
                                 tool_calls_out.push(OaiToolCall {
                                     id: id.clone(),
                                     call_type: "function".to_string(),
@@ -761,7 +799,9 @@ impl LlmDriver for OpenAIDriver {
                             Some(tool_calls_out)
                         },
                         tool_call_id: None,
-                        reasoning_content: if has_tool_calls && self.kimi_needs_reasoning_content(&request.model) {
+                        reasoning_content: if has_tool_calls
+                            && self.kimi_needs_reasoning_content(&request.model)
+                        {
                             Some(String::new())
                         } else {
                             None
@@ -914,7 +954,10 @@ impl LlmDriver for OpenAIDriver {
 
                 // Auto-cap max_tokens when model rejects our value
                 if status == 400 && body.contains("max_tokens") && attempt < max_retries {
-                    let current = oai_request.max_tokens.or(oai_request.max_completion_tokens).unwrap_or(4096);
+                    let current = oai_request
+                        .max_tokens
+                        .or(oai_request.max_completion_tokens)
+                        .unwrap_or(4096);
                     let cap = extract_max_tokens_limit(&body).unwrap_or(current / 2);
                     warn!(old = current, new = cap, "Auto-capping max_tokens (stream)");
                     if oai_request.max_completion_tokens.is_some() {
@@ -1035,9 +1078,8 @@ impl LlmDriver for OpenAIDriver {
                                 for action in think_filter.process(text) {
                                     match action {
                                         FilterAction::EmitText(t) => {
-                                            let _ = tx
-                                                .send(StreamEvent::TextDelta { text: t })
-                                                .await;
+                                            let _ =
+                                                tx.send(StreamEvent::TextDelta { text: t }).await;
                                         }
                                         FilterAction::EmitThinking(t) => {
                                             // Route think content the same way as
@@ -1121,9 +1163,7 @@ impl LlmDriver for OpenAIDriver {
                         let _ = tx.send(StreamEvent::TextDelta { text: t }).await;
                     }
                     FilterAction::EmitThinking(t) => {
-                        let _ = tx
-                            .send(StreamEvent::ThinkingDelta { text: t })
-                            .await;
+                        let _ = tx.send(StreamEvent::ThinkingDelta { text: t }).await;
                     }
                 }
             }
@@ -1180,33 +1220,45 @@ impl LlmDriver for OpenAIDriver {
                     }
                 }
                 if !cleaned.is_empty() {
-                    content.push(ContentBlock::Text { text: cleaned, provider_metadata: None });
+                    content.push(ContentBlock::Text {
+                        text: cleaned,
+                        provider_metadata: None,
+                    });
                 }
             }
 
             // If we have reasoning but no text content and no tool calls,
             // synthesize a brief text block so the agent loop doesn't treat
             // this as an empty response.
-            let has_text = content.iter().any(|b| matches!(b, ContentBlock::Text { .. }));
-            let has_thinking = content.iter().any(|b| matches!(b, ContentBlock::Thinking { .. }));
+            let has_text = content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { .. }));
+            let has_thinking = content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Thinking { .. }));
             if has_thinking && !has_text && tool_accum.is_empty() {
-                let thinking_text = content.iter().find_map(|b| match b {
-                    ContentBlock::Thinking { thinking } => Some(thinking.as_str()),
-                    _ => None,
-                }).unwrap_or("");
+                let thinking_text = content
+                    .iter()
+                    .find_map(|b| match b {
+                        ContentBlock::Thinking { thinking } => Some(thinking.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
                 let summary = extract_thinking_summary(thinking_text);
-                debug!(summary_len = summary.len(), "Synthesizing text from thinking-only stream response");
-                content.push(ContentBlock::Text { text: summary, provider_metadata: None });
+                debug!(
+                    summary_len = summary.len(),
+                    "Synthesizing text from thinking-only stream response"
+                );
+                content.push(ContentBlock::Text {
+                    text: summary,
+                    provider_metadata: None,
+                });
             }
 
             for (id, name, arguments) in &tool_accum {
-                let input: serde_json::Value =
-                    serde_json::from_str(arguments).map_err(|e| {
-                        LlmError::Parse(format!(
-                            "Invalid tool arguments for '{}': {}",
-                            name, e
-                        ))
-                    })?;
+                let input: serde_json::Value = serde_json::from_str(arguments).map_err(|e| {
+                    LlmError::Parse(format!("Invalid tool arguments for '{}': {}", name, e))
+                })?;
                 content.push(ContentBlock::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
@@ -1325,7 +1377,8 @@ fn extract_think_tags(text: &str) -> (String, Option<String>) {
 fn extract_thinking_summary(thinking: &str) -> String {
     let trimmed = thinking.trim();
     if trimmed.is_empty() {
-        return "[The model produced reasoning but no final answer. Try rephrasing your question.]".to_string();
+        return "[The model produced reasoning but no final answer. Try rephrasing your question.]"
+            .to_string();
     }
 
     // Take the last non-empty paragraph (models usually conclude with their answer)
@@ -1344,7 +1397,8 @@ fn extract_thinking_summary(thinking: &str) -> String {
             last[last.len() - 2000..].to_string()
         }
     } else {
-        "[The model produced reasoning but no final answer. Try rephrasing your question.]".to_string()
+        "[The model produced reasoning but no final answer. Try rephrasing your question.]"
+            .to_string()
     }
 }
 
@@ -1604,7 +1658,8 @@ mod tests {
 
     #[test]
     fn test_extract_think_tags_multiple_blocks() {
-        let input = "<think>First thought</think>Middle text<think>Second thought</think>Final text";
+        let input =
+            "<think>First thought</think>Middle text<think>Second thought</think>Final text";
         let (cleaned, thinking) = extract_think_tags(input);
         assert_eq!(cleaned, "Middle textFinal text");
         let t = thinking.unwrap();
@@ -1645,7 +1700,8 @@ mod tests {
 
     #[test]
     fn test_oai_response_message_with_reasoning_content() {
-        let json = r#"{"content": null, "reasoning_content": "Let me think...", "tool_calls": null}"#;
+        let json =
+            r#"{"content": null, "reasoning_content": "Let me think...", "tool_calls": null}"#;
         let msg: OaiResponseMessage = serde_json::from_str(json).unwrap();
         assert!(msg.content.is_none());
         assert_eq!(msg.reasoning_content.as_deref(), Some("Let me think..."));

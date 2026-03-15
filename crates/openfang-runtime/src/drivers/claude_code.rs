@@ -140,9 +140,7 @@ impl ClaudeCodeDriver {
 
     /// Map a model ID like "claude-code/opus" to CLI --model flag value.
     fn model_flag(model: &str) -> Option<String> {
-        let stripped = model
-            .strip_prefix("claude-code/")
-            .unwrap_or(model);
+        let stripped = model.strip_prefix("claude-code/").unwrap_or(model);
         match stripped {
             "opus" => Some("opus".to_string()),
             "sonnet" => Some("sonnet".to_string()),
@@ -229,9 +227,13 @@ fn resolve_claude_path(path: &str) -> String {
 
     let home = {
         #[cfg(not(target_os = "windows"))]
-        { std::env::var("HOME").unwrap_or_default() }
+        {
+            std::env::var("HOME").unwrap_or_default()
+        }
         #[cfg(target_os = "windows")]
-        { std::env::var("USERPROFILE").unwrap_or_default() }
+        {
+            std::env::var("USERPROFILE").unwrap_or_default()
+        }
     };
 
     // Check common installation locations in order of likelihood.
@@ -244,14 +246,14 @@ fn resolve_claude_path(path: &str) -> String {
         vec![]
     } else {
         vec![
-            format!("{}/.local/bin/claude", home),        // npm --prefix ~/.local
-            format!("{}/.npm-global/bin/claude", home),   // npm --prefix ~/.npm-global
-            format!("{}/.yarn/bin/claude", home),          // yarn global
+            format!("{}/.local/bin/claude", home), // npm --prefix ~/.local
+            format!("{}/.npm-global/bin/claude", home), // npm --prefix ~/.npm-global
+            format!("{}/.yarn/bin/claude", home),  // yarn global
         ]
     };
     let static_paths: &[&str] = &[
-        "/opt/homebrew/bin/claude",   // Homebrew (Apple Silicon)
-        "/usr/local/bin/claude",       // Homebrew (Intel) / npm global
+        "/opt/homebrew/bin/claude", // Homebrew (Apple Silicon)
+        "/usr/local/bin/claude",    // Homebrew (Intel) / npm global
         "/usr/bin/claude",
     ];
 
@@ -317,9 +319,7 @@ fn classify_claude_cli_error(output: &str, status_code: u16) -> LlmError {
         || lower.contains("free limit")
         || lower.contains("billing")
     {
-        return LlmError::RateLimited {
-            retry_after_ms: 0,
-        };
+        return LlmError::RateLimited { retry_after_ms: 0 };
     }
     LlmError::Api {
         status: status_code,
@@ -329,10 +329,7 @@ fn classify_claude_cli_error(output: &str, status_code: u16) -> LlmError {
 
 #[async_trait]
 impl LlmDriver for ClaudeCodeDriver {
-    async fn complete(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<CompletionResponse, LlmError> {
+    async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let prompt = Self::build_prompt(&request);
         let model_flag = Self::model_flag(&request.model);
 
@@ -366,19 +363,22 @@ impl LlmDriver for ClaudeCodeDriver {
         let config_label = self.config_dir.as_deref().unwrap_or("default");
         tracing::info!(cli = %self.cli_path, config_dir = %config_label, skip_permissions = %self.skip_permissions, "Spawning Claude Code CLI");
 
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| LlmError::Http(format!(
+        let output = cmd.output().await.map_err(|e| {
+            LlmError::Http(format!(
                 "Claude Code CLI not found or failed to start ({}). \
                  Install: npm install -g @anthropic-ai/claude-code && claude auth",
                 e
-            )))?;
+            ))
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let stdout_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let detail = if !stderr.is_empty() { &stderr } else { &stdout_str };
+            let detail = if !stderr.is_empty() {
+                &stderr
+            } else {
+                &stdout_str
+            };
             let code = output.status.code().unwrap_or(1);
 
             // Check for rate-limit / quota signals first via the classifier.
@@ -394,9 +394,7 @@ impl LlmDriver for ClaudeCodeDriver {
                 || detail.contains("login")
                 || detail.contains("credentials")
             {
-                format!(
-                    "Claude Code CLI is not authenticated. Run: claude auth\nDetail: {detail}"
-                )
+                format!("Claude Code CLI is not authenticated. Run: claude auth\nDetail: {detail}")
             } else if detail.contains("permission")
                 || detail.contains("--dangerously-skip-permissions")
             {
@@ -418,13 +416,17 @@ impl LlmDriver for ClaudeCodeDriver {
 
         // Try JSON parse first
         if let Ok(parsed) = serde_json::from_str::<ClaudeJsonOutput>(&stdout) {
-            let text = parsed.result
+            let text = parsed
+                .result
                 .or(parsed.content)
                 .or(parsed.text)
                 .unwrap_or_default();
             let usage = parsed.usage.unwrap_or_default();
             return Ok(CompletionResponse {
-                content: vec![ContentBlock::Text { text: text.clone(), provider_metadata: None }],
+                content: vec![ContentBlock::Text {
+                    text: text.clone(),
+                    provider_metadata: None,
+                }],
                 stop_reason: StopReason::EndTurn,
                 tool_calls: Vec::new(),
                 usage: TokenUsage {
@@ -437,7 +439,10 @@ impl LlmDriver for ClaudeCodeDriver {
         // Fallback: treat entire stdout as plain text
         let text = stdout.trim().to_string();
         Ok(CompletionResponse {
-            content: vec![ContentBlock::Text { text, provider_metadata: None }],
+            content: vec![ContentBlock::Text {
+                text,
+                provider_metadata: None,
+            }],
             stop_reason: StopReason::EndTurn,
             tool_calls: Vec::new(),
             usage: TokenUsage {
@@ -488,13 +493,13 @@ impl LlmDriver for ClaudeCodeDriver {
         let config_label = self.config_dir.as_deref().unwrap_or("default");
         tracing::info!(cli = %self.cli_path, config_dir = %config_label, skip_permissions = %self.skip_permissions, "Spawning Claude Code CLI (streaming)");
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| LlmError::Http(format!(
+        let mut child = cmd.spawn().map_err(|e| {
+            LlmError::Http(format!(
                 "Claude Code CLI not found or failed to start ({}). \
                  Install: npm install -g @anthropic-ai/claude-code && claude auth",
                 e
-            )))?;
+            ))
+        })?;
 
         let stdout = child
             .stdout
@@ -579,9 +584,7 @@ impl LlmDriver for ClaudeCodeDriver {
                     // Not valid JSON — treat as raw text
                     warn!(line = %line, error = %e, "Non-JSON line from Claude CLI");
                     full_text.push_str(&line);
-                    let _ = tx
-                        .send(StreamEvent::TextDelta { text: line })
-                        .await;
+                    let _ = tx.send(StreamEvent::TextDelta { text: line }).await;
                 }
             }
         }
@@ -598,7 +601,10 @@ impl LlmDriver for ClaudeCodeDriver {
         if !status.success() {
             warn!(code = ?status.code(), stderr = %stderr_text.trim(), "Claude CLI exited with error");
             if full_text.is_empty() {
-                return Err(classify_claude_cli_error(&stderr_text, status.code().unwrap_or(1) as u16));
+                return Err(classify_claude_cli_error(
+                    &stderr_text,
+                    status.code().unwrap_or(1) as u16,
+                ));
             }
         } else {
             tracing::info!(config_dir = %config_label, chars = full_text.len(), "Claude CLI stream completed");
@@ -612,7 +618,10 @@ impl LlmDriver for ClaudeCodeDriver {
             .await;
 
         Ok(CompletionResponse {
-            content: vec![ContentBlock::Text { text: full_text, provider_metadata: None }],
+            content: vec![ContentBlock::Text {
+                text: full_text,
+                provider_metadata: None,
+            }],
             stop_reason: StopReason::EndTurn,
             tool_calls: Vec::new(),
             usage: final_usage,
@@ -622,8 +631,7 @@ impl LlmDriver for ClaudeCodeDriver {
 
 /// Check if the Claude Code CLI is available.
 pub fn claude_code_available() -> bool {
-    ClaudeCodeDriver::detect().is_some()
-        || claude_credentials_exist()
+    ClaudeCodeDriver::detect().is_some() || claude_credentials_exist()
 }
 
 /// Check if Claude credentials file exists.
@@ -645,7 +653,9 @@ fn claude_credentials_exist() -> bool {
 fn home_dir() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from)
+        std::env::var("USERPROFILE")
+            .ok()
+            .map(std::path::PathBuf::from)
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -738,7 +748,8 @@ mod tests {
 
     #[test]
     fn test_classify_usage_limit() {
-        let err = classify_claude_cli_error("Error: usage limit exceeded. Visit claude.ai/upgrade", 1);
+        let err =
+            classify_claude_cli_error("Error: usage limit exceeded. Visit claude.ai/upgrade", 1);
         assert!(matches!(err, LlmError::RateLimited { .. }));
     }
 

@@ -221,9 +221,11 @@ fn extract_session_cookie(request: &Request<Body>) -> Option<String> {
         .get("cookie")
         .and_then(|v| v.to_str().ok())
         .and_then(|cookies| {
-            cookies
-                .split(';')
-                .find_map(|c| c.trim().strip_prefix("openfang_session=").map(|v| v.to_string()))
+            cookies.split(';').find_map(|c| {
+                c.trim()
+                    .strip_prefix("openfang_session=")
+                    .map(|v| v.to_string())
+            })
         })
 }
 
@@ -291,7 +293,10 @@ pub async fn validate_content_type(request: Request<Body>, next: Next) -> Respon
             // Allow multipart/form-data and octet-stream for file upload endpoints
             let path = request.uri().path().to_string();
             let is_upload = path.contains("/upload") || path.contains("/uploads");
-            if !is_upload && !content_type.starts_with("multipart/") && !content_type.starts_with("application/octet-stream") {
+            if !is_upload
+                && !content_type.starts_with("multipart/")
+                && !content_type.starts_with("application/octet-stream")
+            {
                 return Response::builder()
                     .status(StatusCode::UNSUPPORTED_MEDIA_TYPE)
                     .header("content-type", "application/json")
