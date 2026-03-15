@@ -49,6 +49,10 @@ pub struct ClaudeCodeDriver {
     cli_path: String,
     /// Config directory injected as CLAUDE_CONFIG_DIR (multi-account support).
     config_dir: Option<String>,
+    /// When true, pass `--dangerously-skip-permissions` to avoid interactive
+    /// permission prompts that cannot be answered in subprocess mode.
+    /// Defaults to `true` because OpenFang controls the prompt and sandboxes
+    /// tool execution on its own side.
     skip_permissions: bool,
 }
 
@@ -70,7 +74,7 @@ impl ClaudeCodeDriver {
         Self {
             cli_path: resolve_claude_path(&raw),
             config_dir: None,
-            skip_permissions,
+            skip_permissions: true,
         }
     }
 
@@ -80,14 +84,11 @@ impl ClaudeCodeDriver {
     }
 
     /// Create a driver with a specific config directory (for multi-account rotation).
-    pub fn new_with_config(cli_path: Option<String>, config_dir: Option<String>, skip_permissions: bool) -> Self {
-        if skip_permissions {
-            warn!(
-                "Claude Code driver: --dangerously-skip-permissions enabled. \
-                 The CLI will not prompt for tool approvals. \
-                 OpenFang's own capability/RBAC system enforces access control."
-            );
-        }
+    pub fn new_with_config(
+        cli_path: Option<String>,
+        config_dir: Option<String>,
+        skip_permissions: bool,
+    ) -> Self {
         let raw = cli_path
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "claude".to_string());
@@ -363,7 +364,7 @@ impl LlmDriver for ClaudeCodeDriver {
         cmd.stderr(std::process::Stdio::piped());
 
         let config_label = self.config_dir.as_deref().unwrap_or("default");
-        tracing::info!(cli = %self.cli_path, config_dir = %config_label, skip_permissions = self.skip_permissions, "Spawning Claude Code CLI");
+        tracing::info!(cli = %self.cli_path, config_dir = %config_label, skip_permissions = %self.skip_permissions, "Spawning Claude Code CLI");
 
         let output = cmd
             .output()
@@ -485,7 +486,7 @@ impl LlmDriver for ClaudeCodeDriver {
         cmd.stderr(std::process::Stdio::piped());
 
         let config_label = self.config_dir.as_deref().unwrap_or("default");
-        tracing::info!(cli = %self.cli_path, config_dir = %config_label, skip_permissions = self.skip_permissions, "Spawning Claude Code CLI (streaming)");
+        tracing::info!(cli = %self.cli_path, config_dir = %config_label, skip_permissions = %self.skip_permissions, "Spawning Claude Code CLI (streaming)");
 
         let mut child = cmd
             .spawn()

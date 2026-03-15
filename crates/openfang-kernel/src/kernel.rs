@@ -4450,7 +4450,7 @@ impl OpenFangKernel {
                 return Ok(Arc::new(ClaudeCodeDriver::new_with_config(
                     acc.cli_path.clone(),
                     Some(acc.config_dir.clone()),
-                    true,
+                    acc.skip_permissions,
                 )));
             }
 
@@ -4463,7 +4463,7 @@ impl OpenFangKernel {
                         ClaudeCodeDriver::new_with_config(
                             acc.cli_path.clone(),
                             Some(acc.config_dir.clone()),
-                            true,
+                            acc.skip_permissions,
                         )
                     );
                     (driver, String::new())

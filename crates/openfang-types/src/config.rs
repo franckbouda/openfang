@@ -1464,6 +1464,12 @@ pub struct ClaudeCodeAccountConfig {
     /// Override CLI binary path (defaults to "claude" on PATH).
     #[serde(default)]
     pub cli_path: Option<String>,
+    /// Pass `--dangerously-skip-permissions` to Claude Code CLI.
+    /// Required when running as a subprocess (no interactive terminal).
+    /// Defaults to `true` because OpenFang controls the prompt and sandboxes
+    /// tool execution on its own side.
+    #[serde(default = "default_true")]
+    pub skip_permissions: bool,
 }
 
 impl Default for ClaudeCodeAccountConfig {
@@ -1472,6 +1478,7 @@ impl Default for ClaudeCodeAccountConfig {
             config_dir: "~/.claude".to_string(),
             label: None,
             cli_path: None,
+            skip_permissions: true,
         }
     }
 }
