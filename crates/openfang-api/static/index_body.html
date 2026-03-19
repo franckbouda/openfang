@@ -1172,12 +1172,28 @@
                     <div class="form-group">
                       <label>Provider</label>
                       <select class="form-select" x-model="spawnForm.provider">
-                        <option value="anthropic">Anthropic</option><option value="openai">OpenAI</option>
-                        <option value="groq">Groq</option><option value="ollama">Ollama</option>
-                        <option value="google">Google</option><option value="mistral">Mistral</option>
-                        <option value="xai">xAI</option><option value="deepseek">DeepSeek</option>
-                        <option value="cerebras">Cerebras</option><option value="sambanova">SambaNova</option>
-                        <option value="together">Together</option>
+                        <optgroup label="Cloud">
+                          <option value="anthropic">Anthropic</option>
+                          <option value="openai">OpenAI</option>
+                          <option value="gemini">Google Gemini</option>
+                          <option value="groq">Groq</option>
+                          <option value="deepseek">DeepSeek</option>
+                          <option value="openrouter">OpenRouter</option>
+                          <option value="mistral">Mistral</option>
+                          <option value="xai">xAI</option>
+                          <option value="together">Together</option>
+                          <option value="fireworks">Fireworks</option>
+                          <option value="cerebras">Cerebras</option>
+                          <option value="sambanova">SambaNova</option>
+                          <option value="azure">Azure OpenAI</option>
+                          <option value="nvidia">NVIDIA NIM</option>
+                        </optgroup>
+                        <optgroup label="Local">
+                          <option value="ollama">Ollama</option>
+                          <option value="lmstudio">LM Studio</option>
+                          <option value="vllm">vLLM</option>
+                          <option value="lemonade">Lemonade</option>
+                        </optgroup>
                       </select>
                     </div>
                     <div class="form-group">
@@ -2311,7 +2327,7 @@
                       <div class="flex gap-3 items-center">
                         <span class="text-xs text-dim" x-show="skill.version" x-text="'v' + skill.version"></span>
                       </div>
-                      <button class="btn btn-primary btn-sm" @click.stop="installFromClawHub(skill.slug)" :disabled="installingSlug === skill.slug || isSkillInstalled(skill.slug)" x-text="isSkillInstalled(skill.slug) ? 'Installed' : installingSlug === skill.slug ? 'Installing...' : 'Install'"></button>
+                      <button class="btn btn-primary btn-sm" @click.stop="installFromClawHub(skill.slug)" :disabled="installingSlug === skill.slug || skill.installed || isSkillInstalled(skill.slug)" x-text="skill.installed || isSkillInstalled(skill.slug) ? 'Installed' : installingSlug === skill.slug ? 'Installing...' : 'Install'"></button>
                     </div>
                   </div>
                 </template>
@@ -2334,7 +2350,7 @@
                         <span class="text-xs text-dim" x-show="skill.stars" x-text="skill.stars + ' stars'"></span>
                         <span class="text-xs text-dim" x-show="skill.version" x-text="'v' + skill.version"></span>
                       </div>
-                      <button class="btn btn-primary btn-sm" @click.stop="installFromClawHub(skill.slug)" :disabled="installingSlug === skill.slug || isSkillInstalled(skill.slug)" x-text="isSkillInstalled(skill.slug) ? 'Installed' : installingSlug === skill.slug ? 'Installing...' : 'Install'"></button>
+                      <button class="btn btn-primary btn-sm" @click.stop="installFromClawHub(skill.slug)" :disabled="installingSlug === skill.slug || skill.installed || isSkillInstalled(skill.slug)" x-text="skill.installed || isSkillInstalled(skill.slug) ? 'Installed' : installingSlug === skill.slug ? 'Installing...' : 'Install'"></button>
                     </div>
                   </div>
                 </template>
@@ -5082,3 +5098,5 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
 
 <!-- Toast notification container -->
 <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+<script>if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){});}</script>

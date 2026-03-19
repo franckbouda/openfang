@@ -43,6 +43,7 @@ use openfang_channels::webex::WebexAdapter;
 // Wave 5
 use async_trait::async_trait;
 use openfang_channels::dingtalk::DingTalkAdapter;
+use openfang_channels::dingtalk_stream::DingTalkStreamAdapter;
 use openfang_channels::discourse::DiscourseAdapter;
 use openfang_channels::gitter::GitterAdapter;
 use openfang_channels::gotify::GotifyAdapter;
@@ -50,6 +51,7 @@ use openfang_channels::linkedin::LinkedInAdapter;
 use openfang_channels::mumble::MumbleAdapter;
 use openfang_channels::ntfy::NtfyAdapter;
 use openfang_channels::webhook::WebhookAdapter;
+use openfang_channels::wecom::WeComAdapter;
 use openfang_kernel::OpenFangKernel;
 use openfang_types::agent::AgentId;
 use std::collections::HashMap;
@@ -139,6 +141,10 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             .send_message(agent_id, message)
             .await
             .map_err(|e| format!("{e}"))?;
+        // Silent/NO_REPLY responses should not be forwarded to channels
+        if result.silent {
+            return Ok(String::new());
+        }
         Ok(result.response)
     }
 
@@ -859,12 +865,17 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             // Wave 5
             "mumble" => channels.mumble.as_ref().map(|c| c.overrides.clone()),
             "dingtalk" => channels.dingtalk.as_ref().map(|c| c.overrides.clone()),
+            "dingtalk_stream" => channels
+                .dingtalk_stream
+                .as_ref()
+                .map(|c| c.overrides.clone()),
             "discourse" => channels.discourse.as_ref().map(|c| c.overrides.clone()),
             "gitter" => channels.gitter.as_ref().map(|c| c.overrides.clone()),
             "ntfy" => channels.ntfy.as_ref().map(|c| c.overrides.clone()),
             "gotify" => channels.gotify.as_ref().map(|c| c.overrides.clone()),
             "webhook" => channels.webhook.as_ref().map(|c| c.overrides.clone()),
             "linkedin" => channels.linkedin.as_ref().map(|c| c.overrides.clone()),
+            "wecom" => channels.wecom.as_ref().map(|c| c.overrides.clone()),
             _ => None,
         }
     }
@@ -1081,7 +1092,8 @@ fn read_token(env_var_or_token: &str, adapter_name: &str) -> Option<String> {
         || env_var_or_token.starts_with("xoxb-")
         || env_var_or_token.starts_with("xapp-")
         || env_var_or_token.starts_with("sk-")
-        || env_var_or_token.starts_with("Bearer ");
+        || env_var_or_token.starts_with("Bearer ")
+        || env_var_or_token.len() > 80; // Long random strings are tokens, not env var names
 
     if looks_like_token {
         warn!(
@@ -1162,6 +1174,7 @@ pub async fn start_channel_bridge_with_config(
         // Wave 5
         || config.mumble.is_some()
         || config.dingtalk.is_some()
+        || config.dingtalk_stream.is_some()
         || config.discourse.is_some()
         || config.gitter.is_some()
         || config.ntfy.is_some()
@@ -1483,10 +1496,20 @@ pub async fn start_channel_bridge_with_config(
     // Feishu/Lark
     if let Some(ref fs_config) = config.feishu {
         if let Some(secret) = read_token(&fs_config.app_secret_env, "Feishu") {
-            let adapter = Arc::new(FeishuAdapter::new(
+            let region = openfang_channels::feishu::FeishuRegion::parse_region(&fs_config.region);
+            let encrypt_key = fs_config
+                .encrypt_key_env
+                .as_ref()
+                .and_then(|env| read_token(env, "Feishu encrypt_key"));
+            let adapter = Arc::new(FeishuAdapter::with_config(
                 fs_config.app_id.clone(),
                 secret,
                 fs_config.webhook_port,
+                region,
+                Some(fs_config.webhook_path.clone()),
+                fs_config.verification_token.clone(),
+                encrypt_key,
+                fs_config.bot_names.clone(),
             ));
             adapters.push((adapter, fs_config.default_agent.clone()));
         }
@@ -1497,6 +1520,21 @@ pub async fn start_channel_bridge_with_config(
         if let Some(token) = read_token(&rv_config.bot_token_env, "Revolt") {
             let adapter = Arc::new(RevoltAdapter::new(token));
             adapters.push((adapter, rv_config.default_agent.clone()));
+        }
+    }
+
+    // WeCom/WeChat Work
+    if let Some(ref wc_config) = config.wecom {
+        if let Some(secret) = read_token(&wc_config.secret_env, "WeCom") {
+            let adapter = Arc::new(WeComAdapter::with_verification(
+                wc_config.corp_id.clone(),
+                wc_config.agent_id.clone(),
+                secret,
+                wc_config.webhook_port,
+                wc_config.encoding_aes_key.clone(),
+                wc_config.token.clone(),
+            ));
+            adapters.push((adapter, wc_config.default_agent.clone()));
         }
     }
 
@@ -1606,12 +1644,27 @@ pub async fn start_channel_bridge_with_config(
         }
     }
 
-    // DingTalk
+    // DingTalk (webhook mode)
     if let Some(ref dt_config) = config.dingtalk {
         if let Some(token) = read_token(&dt_config.access_token_env, "DingTalk") {
             let secret = read_token(&dt_config.secret_env, "DingTalk (secret)").unwrap_or_default();
             let adapter = Arc::new(DingTalkAdapter::new(token, secret, dt_config.webhook_port));
             adapters.push((adapter, dt_config.default_agent.clone()));
+        }
+    }
+
+    // DingTalk (stream mode)
+    if let Some(ref ds_config) = config.dingtalk_stream {
+        if let Some(app_key) = read_token(&ds_config.app_key_env, "DingTalk Stream (app_key)") {
+            if let Some(app_secret) =
+                read_token(&ds_config.app_secret_env, "DingTalk Stream (app_secret)")
+            {
+                let robot_code =
+                    read_token(&ds_config.robot_code_env, "DingTalk Stream (robot_code)")
+                        .unwrap_or_else(|| app_key.clone());
+                let adapter = Arc::new(DingTalkStreamAdapter::new(app_key, app_secret, robot_code));
+                adapters.push((adapter, ds_config.default_agent.clone()));
+            }
         }
     }
 
