@@ -17,8 +17,8 @@ use zeroize::Zeroizing;
 pub struct CredentialResolver {
     /// Reference to the credential vault.
     vault: Option<CredentialVault>,
-    /// Dotenv entries (loaded from `~/.openfang/.env`).
-    dotenv: HashMap<String, String>,
+    /// Dotenv entries (loaded from `~/.openfang/.env`). Values are zeroized on drop.
+    dotenv: HashMap<String, Zeroizing<String>>,
     /// Whether to prompt interactively as a last resort.
     interactive: bool,
 }
@@ -26,8 +26,12 @@ pub struct CredentialResolver {
 impl CredentialResolver {
     /// Create a resolver with optional vault and dotenv path.
     pub fn new(vault: Option<CredentialVault>, dotenv_path: Option<&Path>) -> Self {
-        let dotenv = if let Some(path) = dotenv_path {
-            load_dotenv(path).unwrap_or_default()
+        let dotenv: HashMap<String, Zeroizing<String>> = if let Some(path) = dotenv_path {
+            load_dotenv(path)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(k, v)| (k, Zeroizing::new(v)))
+                .collect()
         } else {
             HashMap::new()
         };
@@ -59,7 +63,7 @@ impl CredentialResolver {
         // 2. Dotenv file
         if let Some(val) = self.dotenv.get(key) {
             debug!("Credential '{}' resolved from .env", key);
-            return Some(Zeroizing::new(val.clone()));
+            return Some(Zeroizing::new(val.as_str().to_string()));
         }
 
         // 3. Environment variable
