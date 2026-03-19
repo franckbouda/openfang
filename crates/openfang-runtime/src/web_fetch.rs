@@ -29,7 +29,7 @@ impl WebFetchEngine {
             .deflate(true)
             .brotli(true)
             .build()
-            .unwrap_or_default();
+            .expect("Failed to build HTTP client — cannot proceed without timeout");
         Self {
             config,
             client,
@@ -119,10 +119,25 @@ impl WebFetchEngine {
             .unwrap_or("")
             .to_string();
 
-        let resp_body = resp
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read response body: {e}"))?;
+        // Read body with size limit to prevent OOM from streaming responses
+        // without Content-Length (issue #61).
+        let max_bytes = self.config.max_response_bytes;
+        let resp_body = {
+            let mut body_bytes = Vec::with_capacity(std::cmp::min(max_bytes, 1024 * 1024));
+            let mut stream = resp.bytes_stream();
+            use futures::StreamExt;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| format!("Failed to read response body: {e}"))?;
+                body_bytes.extend_from_slice(&chunk);
+                if body_bytes.len() > max_bytes {
+                    return Err(format!(
+                        "Response exceeds {} bytes limit (streaming)",
+                        max_bytes
+                    ));
+                }
+            }
+            String::from_utf8_lossy(&body_bytes).into_owned()
+        };
 
         // Step 4: For GET requests, detect HTML and convert to Markdown.
         // For non-GET (API calls), return raw body — don't mangle JSON/XML responses.
@@ -234,14 +249,76 @@ pub(crate) fn check_ssrf(url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Check if an IP address is in a private range.
+/// Async variant of `check_ssrf` — runs DNS resolution on a blocking thread
+/// to avoid stalling the Tokio runtime (issue #55).
+/// Callers should migrate from `check_ssrf` to this async version.
+#[allow(dead_code)]
+pub(crate) async fn check_ssrf_async(url: &str) -> Result<(), String> {
+    // Scheme check (fast, no I/O)
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("Only http:// and https:// URLs are allowed".to_string());
+    }
+
+    let host = extract_host(url);
+    let hostname = if host.starts_with('[') {
+        host.find(']')
+            .map(|i| host[..=i].to_string())
+            .unwrap_or_else(|| host.clone())
+    } else {
+        host.split(':').next().unwrap_or(&host).to_string()
+    };
+
+    let blocked = [
+        "localhost",
+        "ip6-localhost",
+        "metadata.google.internal",
+        "metadata.aws.internal",
+        "instance-data",
+        "169.254.169.254",
+        "100.100.100.200",
+        "192.0.0.192",
+        "0.0.0.0",
+        "::1",
+        "[::1]",
+    ];
+    if blocked.contains(&hostname.as_str()) {
+        return Err(format!("SSRF blocked: {hostname} is a restricted hostname"));
+    }
+
+    let port: u16 = if url.starts_with("https") { 443 } else { 80 };
+    let socket_addr = format!("{hostname}:{port}");
+
+    tokio::task::spawn_blocking(move || {
+        if let Ok(addrs) = socket_addr.to_socket_addrs() {
+            for addr in addrs {
+                let ip = addr.ip();
+                if ip.is_loopback() || ip.is_unspecified() || is_private_ip(&ip) {
+                    return Err(format!(
+                        "SSRF blocked: {hostname} resolves to private IP {ip}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("SSRF check failed: {e}"))?
+}
+
+/// Check if an IP address is in a private/reserved range.
 fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let octets = v4.octets();
             matches!(
                 octets,
-                [10, ..] | [172, 16..=31, ..] | [192, 168, ..] | [169, 254, ..]
+                [10, ..]
+                    | [172, 16..=31, ..]
+                    | [192, 168, ..]
+                    | [169, 254, ..]
+                    | [100, 64..=127, ..]  // CG-NAT / Tailscale (100.64.0.0/10)
+                    | [0, ..]              // 0.0.0.0/8
+                    | [240..=255, ..]       // 240.0.0.0/4 (reserved)
             )
         }
         IpAddr::V6(v6) => {

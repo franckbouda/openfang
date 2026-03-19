@@ -34,7 +34,12 @@ type HmacSha256 = Hmac<Sha256>;
 pub struct NonceTracker {
     seen: Arc<DashMap<String, Instant>>,
     window: Duration,
+    /// Counter for amortized GC — only run retain() every N insertions.
+    insert_count: Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// GC every 100 insertions instead of every insertion.
+const GC_INTERVAL: u64 = 100;
 
 impl NonceTracker {
     /// Create a new nonce tracker with a 5-minute replay window.
@@ -42,6 +47,7 @@ impl NonceTracker {
         Self {
             seen: Arc::new(DashMap::new()),
             window: Duration::from_secs(300), // 5 minutes
+            insert_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -50,9 +56,14 @@ impl NonceTracker {
     pub fn check_and_record(&self, nonce: &str) -> Result<(), String> {
         let now = Instant::now();
 
-        // Garbage-collect expired nonces (older than window)
-        self.seen
-            .retain(|_, ts| now.duration_since(*ts) < self.window);
+        // Amortized GC: only run retain() every GC_INTERVAL insertions
+        let count = self
+            .insert_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count.is_multiple_of(GC_INTERVAL) {
+            self.seen
+                .retain(|_, ts| now.duration_since(*ts) < self.window);
+        }
 
         // Check for replay
         if self.seen.contains_key(nonce) {
