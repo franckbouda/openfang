@@ -89,16 +89,11 @@ pub fn compute_backoff(config: &RetryConfig, attempt: u32) -> u64 {
     (with_jitter as u64).min(config.max_delay_ms)
 }
 
-/// Return a pseudo-random fraction in `[0, 1)` using the current system time
-/// nanos. This is NOT cryptographically secure, but good enough for jitter.
+/// Return a random fraction in `[0, 1)` using a proper RNG.
+/// Avoids thundering herd by ensuring different threads/agents get different jitter.
 fn pseudo_random_fraction() -> f64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    // Mix the bits a bit to reduce predictability.
-    let mixed = nanos.wrapping_mul(2654435761); // Knuth multiplicative hash
-    (mixed as f64) / (u32::MAX as f64)
+    use rand::Rng;
+    rand::thread_rng().gen::<f64>()
 }
 
 // ---------------------------------------------------------------------------
@@ -194,10 +189,13 @@ where
         }
     }
 
-    // Should not be reachable, but handle gracefully.
-    RetryOutcome::Exhausted {
-        last_error: last_error.expect("at least one attempt should have been made"),
-        attempts: max,
+    // Structurally unreachable (max >= 1 guarantees loop runs), but handle gracefully.
+    match last_error {
+        Some(err) => RetryOutcome::Exhausted {
+            last_error: err,
+            attempts: max,
+        },
+        None => unreachable!("retry loop with max={max} must execute at least once"),
     }
 }
 

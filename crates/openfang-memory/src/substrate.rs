@@ -267,6 +267,170 @@ impl MemorySubstrate {
     }
 
     // -----------------------------------------------------------------
+    // Async wrappers — run SQLite operations on a blocking thread
+    // to avoid blocking the Tokio runtime (issue #54).
+    // -----------------------------------------------------------------
+
+    /// Async wrapper for `save_agent`.
+    pub async fn save_agent_async(&self, entry: &AgentEntry) -> OpenFangResult<()> {
+        let store = self.structured.clone();
+        let entry = entry.clone();
+        tokio::task::spawn_blocking(move || store.save_agent(&entry))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Async wrapper for `load_agent`.
+    pub async fn load_agent_async(&self, agent_id: AgentId) -> OpenFangResult<Option<AgentEntry>> {
+        let store = self.structured.clone();
+        tokio::task::spawn_blocking(move || store.load_agent(agent_id))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Async wrapper for `load_all_agents`.
+    pub async fn load_all_agents_async(&self) -> OpenFangResult<Vec<AgentEntry>> {
+        let store = self.structured.clone();
+        tokio::task::spawn_blocking(move || store.load_all_agents())
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Async wrapper for `list_agents`.
+    pub async fn list_agents_async(&self) -> OpenFangResult<Vec<(String, String, String)>> {
+        let store = self.structured.clone();
+        tokio::task::spawn_blocking(move || store.list_agents())
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Async wrapper for `structured_get`.
+    pub async fn structured_get_async(
+        &self,
+        agent_id: AgentId,
+        key: &str,
+    ) -> OpenFangResult<Option<serde_json::Value>> {
+        let store = self.structured.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || store.get(agent_id, &key))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Async wrapper for `structured_set`.
+    pub async fn structured_set_async(
+        &self,
+        agent_id: AgentId,
+        key: &str,
+        value: serde_json::Value,
+    ) -> OpenFangResult<()> {
+        let store = self.structured.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || store.set(agent_id, &key, value))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Async wrapper for `structured_delete`.
+    pub async fn structured_delete_async(&self, agent_id: AgentId, key: &str) -> OpenFangResult<()> {
+        let store = self.structured.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || store.delete(agent_id, &key))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Async wrapper for `list_kv`.
+    pub async fn list_kv_async(&self, agent_id: AgentId) -> OpenFangResult<Vec<(String, serde_json::Value)>> {
+        let store = self.structured.clone();
+        tokio::task::spawn_blocking(move || store.list_kv(agent_id))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Async wrapper for `get_session`.
+    pub async fn get_session_async(&self, session_id: SessionId) -> OpenFangResult<Option<Session>> {
+        let sessions = self.sessions.clone();
+        tokio::task::spawn_blocking(move || sessions.get_session(session_id))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Async wrapper for `list_sessions`.
+    pub async fn list_sessions_async(&self) -> OpenFangResult<Vec<serde_json::Value>> {
+        let sessions = self.sessions.clone();
+        tokio::task::spawn_blocking(move || sessions.list_sessions())
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Async wrapper for `delete_session`.
+    pub async fn delete_session_async(&self, session_id: SessionId) -> OpenFangResult<()> {
+        let sessions = self.sessions.clone();
+        tokio::task::spawn_blocking(move || sessions.delete_session(session_id))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Async wrapper for `list_agent_sessions`.
+    pub async fn list_agent_sessions_async(&self, agent_id: AgentId) -> OpenFangResult<Vec<serde_json::Value>> {
+        let sessions = self.sessions.clone();
+        tokio::task::spawn_blocking(move || sessions.list_agent_sessions(agent_id))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Async wrapper for `create_session`.
+    pub async fn create_session_async(&self, agent_id: AgentId) -> OpenFangResult<Session> {
+        let sessions = self.sessions.clone();
+        tokio::task::spawn_blocking(move || sessions.create_session(agent_id))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Async wrapper for `remove_agent`.
+    pub async fn remove_agent_async(&self, agent_id: AgentId) -> OpenFangResult<()> {
+        let sessions = self.sessions.clone();
+        let structured = self.structured.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = sessions.delete_agent_sessions(agent_id);
+            structured.remove_agent(agent_id)
+        })
+        .await
+        .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Async wrapper for `load_paired_devices`.
+    pub async fn load_paired_devices_async(&self) -> OpenFangResult<Vec<serde_json::Value>> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let db = conn.lock().map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let mut stmt = db.prepare(
+                "SELECT device_id, display_name, platform, paired_at, last_seen, push_token FROM paired_devices"
+            ).map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(serde_json::json!({
+                        "device_id": row.get::<_, String>(0)?,
+                        "display_name": row.get::<_, String>(1)?,
+                        "platform": row.get::<_, String>(2)?,
+                        "paired_at": row.get::<_, String>(3)?,
+                        "last_seen": row.get::<_, String>(4)?,
+                        "push_token": row.get::<_, Option<String>>(5)?,
+                    }))
+                })
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let mut devices = Vec::new();
+            for row in rows {
+                devices.push(row.map_err(|e| OpenFangError::Memory(e.to_string()))?);
+            }
+            Ok(devices)
+        })
+        .await
+        .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    // -----------------------------------------------------------------
     // Paired devices persistence
     // -----------------------------------------------------------------
 
