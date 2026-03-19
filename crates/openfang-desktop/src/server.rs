@@ -107,7 +107,7 @@ fn enrich_path() {
 
     let current = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", extra.join(":"), current);
-    std::env::set_var("PATH", &new_path);
+    openfang_types::set_env_var("PATH", &new_path);
     info!("Enriched PATH with {} extra directories", extra.len());
 }
 

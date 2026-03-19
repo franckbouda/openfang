@@ -1813,7 +1813,7 @@ pub async fn reload_channels_from_disk(
                             value = value[1..value.len() - 1].to_string();
                         }
                         // Always overwrite — the file is the source of truth after dashboard edits
-                        std::env::set_var(key, &value);
+                        openfang_types::set_env_var(key, &value);
                     }
                 }
             }
