@@ -197,11 +197,12 @@ fn extract_env_var_refs(line: &str) -> Vec<String> {
                     var.push(c);
                 }
             } else {
-                for c in chars.by_ref() {
+                while let Some(&c) = chars.peek() {
                     if c.is_alphanumeric() || c == '_' {
                         var.push(c);
+                        chars.next();
                     } else {
-                        break;
+                        break; // don't consume the terminator character
                     }
                 }
             }

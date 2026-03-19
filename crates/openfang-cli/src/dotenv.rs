@@ -55,7 +55,7 @@ fn load_env_file(path: Option<PathBuf>) {
 
         if let Some((key, value)) = parse_env_line(trimmed) {
             if std::env::var(&key).is_err() {
-                std::env::set_var(&key, &value);
+                openfang_types::set_env_var(&key, &value);
             }
         }
     }
@@ -78,7 +78,7 @@ pub fn save_env_key(key: &str, value: &str) -> Result<(), String> {
     write_env_file(&path, &entries)?;
 
     // Also set in current process
-    std::env::set_var(key, value);
+    openfang_types::set_env_var(key, value);
 
     Ok(())
 }

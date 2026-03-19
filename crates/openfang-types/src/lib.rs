@@ -22,6 +22,26 @@ pub mod tool;
 pub mod tool_compat;
 pub mod webhook;
 
+/// Set an environment variable with documented unsafety.
+///
+/// `std::env::set_var` is unsound in multi-threaded programs because libc
+/// `setenv` is not thread-safe. On Rust 2024 edition this requires `unsafe`.
+/// This wrapper centralises all env mutations so they can be audited, and
+/// uses a global mutex to serialise concurrent calls (issue #56).
+///
+/// **Prefer passing values through `KernelConfig` or `Command::env()` instead.**
+pub fn set_env_var(key: &str, value: &str) {
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: serialised via ENV_LOCK. No other code should call
+    // std::env::set_var directly — use this function instead.
+    #[allow(unused_unsafe)]
+    unsafe {
+        std::env::set_var(key, value);
+    }
+}
+
 /// Safely truncate a string to at most `max_bytes`, never splitting a UTF-8 char.
 pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {

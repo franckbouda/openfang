@@ -4,6 +4,7 @@
 //! Pipeline: SSRF check → cache lookup → HTTP GET → detect HTML →
 //! html_to_markdown() → truncate → wrap_external_content() → cache → return
 
+use crate::str_utils::safe_truncate_str;
 use crate::web_cache::WebCache;
 use crate::web_content::{html_to_markdown, wrap_external_content};
 use openfang_types::config::WebFetchConfig;
@@ -22,9 +23,13 @@ impl WebFetchEngine {
     /// Create a new fetch engine from config with a shared cache.
     pub fn new(config: WebFetchConfig, cache: Arc<WebCache>) -> Self {
         let client = reqwest::Client::builder()
+            .user_agent(crate::USER_AGENT)
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .gzip(true)
+            .deflate(true)
+            .brotli(true)
             .build()
-            .unwrap_or_default();
+            .expect("Failed to build HTTP client — cannot proceed without timeout");
         Self {
             config,
             client,
@@ -67,7 +72,10 @@ impl WebFetchEngine {
             "DELETE" => self.client.delete(url),
             _ => self.client.get(url),
         };
-        req = req.header("User-Agent", "Mozilla/5.0 (compatible; OpenFangAgent/0.1)");
+        req = req.header(
+            "User-Agent",
+            format!("Mozilla/5.0 (compatible; {})", crate::USER_AGENT),
+        );
 
         // Add custom headers
         if let Some(hdrs) = headers {
@@ -111,10 +119,25 @@ impl WebFetchEngine {
             .unwrap_or("")
             .to_string();
 
-        let resp_body = resp
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read response body: {e}"))?;
+        // Read body with size limit to prevent OOM from streaming responses
+        // without Content-Length (issue #61).
+        let max_bytes = self.config.max_response_bytes;
+        let resp_body = {
+            let mut body_bytes = Vec::with_capacity(std::cmp::min(max_bytes, 1024 * 1024));
+            let mut stream = resp.bytes_stream();
+            use futures::StreamExt;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| format!("Failed to read response body: {e}"))?;
+                body_bytes.extend_from_slice(&chunk);
+                if body_bytes.len() > max_bytes {
+                    return Err(format!(
+                        "Response exceeds {} bytes limit (streaming)",
+                        max_bytes
+                    ));
+                }
+            }
+            String::from_utf8_lossy(&body_bytes).into_owned()
+        };
 
         // Step 4: For GET requests, detect HTML and convert to Markdown.
         // For non-GET (API calls), return raw body — don't mangle JSON/XML responses.
@@ -132,11 +155,11 @@ impl WebFetchEngine {
             resp_body
         };
 
-        // Step 5: Truncate
+        // Step 5: Truncate (char-boundary-safe to avoid panics on multi-byte UTF-8)
         let truncated = if processed.len() > self.config.max_chars {
             format!(
                 "{}... [truncated, {} total chars]",
-                &processed[..self.config.max_chars],
+                safe_truncate_str(&processed, self.config.max_chars),
                 processed.len()
             )
         } else {
@@ -186,9 +209,7 @@ pub(crate) fn check_ssrf(url: &str) -> Result<(), String> {
     let host = extract_host(url);
     // For IPv6 bracket notation like [::1]:80, extract [::1] as hostname
     let hostname = if host.starts_with('[') {
-        host.find(']')
-            .map(|i| &host[..=i])
-            .unwrap_or(&host)
+        host.find(']').map(|i| &host[..=i]).unwrap_or(&host)
     } else {
         host.split(':').next().unwrap_or(&host)
     };
@@ -228,14 +249,76 @@ pub(crate) fn check_ssrf(url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Check if an IP address is in a private range.
+/// Async variant of `check_ssrf` — runs DNS resolution on a blocking thread
+/// to avoid stalling the Tokio runtime (issue #55).
+/// Callers should migrate from `check_ssrf` to this async version.
+#[allow(dead_code)]
+pub(crate) async fn check_ssrf_async(url: &str) -> Result<(), String> {
+    // Scheme check (fast, no I/O)
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("Only http:// and https:// URLs are allowed".to_string());
+    }
+
+    let host = extract_host(url);
+    let hostname = if host.starts_with('[') {
+        host.find(']')
+            .map(|i| host[..=i].to_string())
+            .unwrap_or_else(|| host.clone())
+    } else {
+        host.split(':').next().unwrap_or(&host).to_string()
+    };
+
+    let blocked = [
+        "localhost",
+        "ip6-localhost",
+        "metadata.google.internal",
+        "metadata.aws.internal",
+        "instance-data",
+        "169.254.169.254",
+        "100.100.100.200",
+        "192.0.0.192",
+        "0.0.0.0",
+        "::1",
+        "[::1]",
+    ];
+    if blocked.contains(&hostname.as_str()) {
+        return Err(format!("SSRF blocked: {hostname} is a restricted hostname"));
+    }
+
+    let port: u16 = if url.starts_with("https") { 443 } else { 80 };
+    let socket_addr = format!("{hostname}:{port}");
+
+    tokio::task::spawn_blocking(move || {
+        if let Ok(addrs) = socket_addr.to_socket_addrs() {
+            for addr in addrs {
+                let ip = addr.ip();
+                if ip.is_loopback() || ip.is_unspecified() || is_private_ip(&ip) {
+                    return Err(format!(
+                        "SSRF blocked: {hostname} resolves to private IP {ip}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("SSRF check failed: {e}"))?
+}
+
+/// Check if an IP address is in a private/reserved range.
 fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let octets = v4.octets();
             matches!(
                 octets,
-                [10, ..] | [172, 16..=31, ..] | [192, 168, ..] | [169, 254, ..]
+                [10, ..]
+                    | [172, 16..=31, ..]
+                    | [192, 168, ..]
+                    | [169, 254, ..]
+                    | [100, 64..=127, ..]  // CG-NAT / Tailscale (100.64.0.0/10)
+                    | [0, ..]              // 0.0.0.0/8
+                    | [240..=255, ..]       // 240.0.0.0/4 (reserved)
             )
         }
         IpAddr::V6(v6) => {
@@ -277,6 +360,28 @@ fn extract_host(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::str_utils::safe_truncate_str;
+
+    #[test]
+    fn test_truncate_multibyte_no_panic() {
+        // Simulate a gzip-decoded response containing multi-byte UTF-8
+        // (Chinese, Japanese, emoji — common on international finance sites).
+        // Old code: &s[..max] panics when max lands inside a multi-byte char.
+        let content = "\u{4f60}\u{597d}\u{4e16}\u{754c}!"; // "你好世界!" = 13 bytes
+                                                           // Truncate at byte 7 — lands inside the 3rd Chinese char (bytes 6..9).
+                                                           // safe_truncate_str walks back to byte 6, returning "你好".
+        let truncated = safe_truncate_str(content, 7);
+        assert_eq!(truncated, "\u{4f60}\u{597d}");
+        assert!(truncated.len() <= 7);
+    }
+
+    #[test]
+    fn test_truncate_emoji_no_panic() {
+        let content = "\u{1f4b0}\u{1f4c8}\u{1f4b9}"; // 💰📈💹 = 12 bytes
+                                                     // Truncate at byte 5 — lands inside the 2nd emoji (bytes 4..8).
+        let truncated = safe_truncate_str(content, 5);
+        assert_eq!(truncated, "\u{1f4b0}"); // 4 bytes
+    }
 
     #[test]
     fn test_ssrf_blocks_localhost() {

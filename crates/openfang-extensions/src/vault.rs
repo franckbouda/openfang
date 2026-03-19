@@ -129,6 +129,61 @@ impl CredentialVault {
         Ok(())
     }
 
+    /// Initialize vault and return the display key if a NEW key was generated.
+    ///
+    /// Returns `Some(key_b64)` when a new key was generated (user should save it).
+    /// Returns `None` when an existing key was found in the OS keyring or env var.
+    pub fn init_and_get_display_key(&mut self) -> ExtensionResult<Option<Zeroizing<String>>> {
+        if self.path.exists() {
+            return Err(ExtensionError::Vault(
+                "Vault already exists. Delete it first to re-initialize.".to_string(),
+            ));
+        }
+
+        let mut newly_generated = false;
+
+        let key_bytes = if let Ok(existing_b64) = std::env::var(VAULT_KEY_ENV) {
+            info!("Using existing vault key from {}", VAULT_KEY_ENV);
+            decode_master_key(&existing_b64)?
+        } else if let Ok(existing_b64) = load_keyring_key() {
+            info!("Using existing vault key from OS keyring");
+            decode_master_key(&existing_b64)?
+        } else {
+            newly_generated = true;
+            let mut kb = Zeroizing::new([0u8; 32]);
+            OsRng.fill_bytes(kb.as_mut());
+            let key_b64 = Zeroizing::new(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                kb.as_ref(),
+            ));
+            match store_keyring_key(&key_b64) {
+                Ok(()) => info!("Vault master key stored in OS keyring"),
+                Err(e) => warn!(
+                    "Could not store in OS keyring: {e}. Set {} env var instead.",
+                    VAULT_KEY_ENV
+                ),
+            }
+            kb
+        };
+
+        let display_key = if newly_generated {
+            Some(Zeroizing::new(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                key_bytes.as_ref(),
+            )))
+        } else {
+            None
+        };
+
+        self.entries.clear();
+        self.unlocked = true;
+        self.save(&key_bytes)?;
+        self.cached_key = Some(key_bytes);
+        info!("Credential vault initialized at {:?}", self.path);
+
+        Ok(display_key)
+    }
+
     /// Unlock the vault by loading and decrypting entries.
     pub fn unlock(&mut self) -> ExtensionResult<()> {
         if self.unlocked {
@@ -430,12 +485,18 @@ fn store_keyring_key(key_b64: &str) -> Result<(), String> {
         // In production, we'd use the `keyring` crate. Since it's an optional
         // heavy dependency, we use a file-based fallback that's still better
         // than plaintext env vars.
-        let keyring_path = dirs::data_local_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("openfang")
-            .join(".keyring");
-        std::fs::create_dir_all(keyring_path.parent().unwrap())
-            .map_err(|e| format!("mkdir: {e}"))?;
+        let data_dir = dirs::data_local_dir()
+            .ok_or("Cannot determine data directory — refusing to use temp dir for keyring")?;
+        let keyring_path = data_dir.join("openfang").join(".keyring");
+        let parent = keyring_path
+            .parent()
+            .ok_or("Cannot determine keyring parent directory")?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
 
         // Store encrypted with a machine-specific key
         let machine_id = machine_fingerprint();
@@ -466,10 +527,9 @@ fn store_keyring_key(key_b64: &str) -> Result<(), String> {
 fn load_keyring_key() -> Result<Zeroizing<String>, String> {
     #[cfg(not(test))]
     {
-        let keyring_path = dirs::data_local_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("openfang")
-            .join(".keyring");
+        let data_dir = dirs::data_local_dir()
+            .ok_or("Cannot determine data directory")?;
+        let keyring_path = data_dir.join("openfang").join(".keyring");
         if !keyring_path.exists() {
             return Err("Keyring file not found".to_string());
         }

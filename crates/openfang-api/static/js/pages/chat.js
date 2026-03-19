@@ -11,6 +11,8 @@ function chatPage() {
     messageQueue: [],    // Queue for messages sent while streaming
     thinkingMode: 'off', // 'off' | 'on' | 'stream'
     _wsAgent: null,
+    _wsReconnectMsg: null,   // Non-null when actively reconnecting (shows status to user)
+    _draftRestored: false,   // True when a draft was restored from localStorage
     showSlashMenu: false,
     slashFilter: '',
     slashIdx: 0,
@@ -100,6 +102,24 @@ function chatPage() {
       return short.length > 24 ? short.substring(0, 22) + '\u2026' : short;
     },
 
+    /// Compact badge label: "provider · model-name" for display under the chat header.
+    get modelBadgeLabel() {
+      if (!this.currentAgent) return '';
+      var provider = this.currentAgent.model_provider || '';
+      var name = this.currentAgent.model_name || '';
+      // Strip date suffix from model names (e.g. claude-3-5-sonnet-20241022 → claude-3-5-sonnet)
+      var shortName = name.replace(/-\d{8}$/, '');
+      if (shortName.length > 28) shortName = shortName.substring(0, 26) + '\u2026';
+      if (provider && shortName) return provider + ' \u00b7 ' + shortName;
+      return shortName || provider;
+    },
+
+    /// Model tier indicator (free/pro/premium) if present.
+    get modelTierLabel() {
+      if (!this.currentAgent) return '';
+      return this.currentAgent.model_tier || '';
+    },
+
     get switcherProviders() {
       var seen = {};
       (this._modelCache || []).forEach(function(m) { seen[m.provider] = true; });
@@ -187,6 +207,9 @@ function chatPage() {
 
       // Watch for slash commands + model autocomplete
       this.$watch('inputText', function(val) {
+        // Auto-save draft to localStorage on every keystroke
+        self.saveDraft();
+
         var modelMatch = val.match(/^\/model\s+(.*)$/i);
         if (modelMatch) {
           self.showSlashMenu = false;
@@ -264,9 +287,10 @@ function chatPage() {
       if (model.id === this.currentAgent.model_name) { this.showModelSwitcher = false; return; }
       var self = this;
       this.modelSwitching = true;
-      OpenFangAPI.put('/api/agents/' + this.currentAgent.id + '/model', { model: model.id }).then(function() {
-        self.currentAgent.model_name = model.id;
-        self.currentAgent.model_provider = model.provider;
+      OpenFangAPI.put('/api/agents/' + this.currentAgent.id + '/model', { model: model.id }).then(function(resp) {
+        // Use server-resolved model/provider to stay in sync (fixes #387/#466)
+        self.currentAgent.model_name = (resp && resp.model) || model.id;
+        self.currentAgent.model_provider = (resp && resp.provider) || model.provider;
         OpenFangToast.success('Switched to ' + (model.display_name || model.id));
         self.showModelSwitcher = false;
         self.modelSwitching = false;
@@ -421,9 +445,12 @@ function chatPage() {
           if (self.currentAgent) {
             if (cmdArgs) {
               OpenFangAPI.put('/api/agents/' + self.currentAgent.id + '/model', { model: cmdArgs }).then(function(resp) {
-                self.currentAgent.model_name = cmdArgs;
-                if (resp && resp.provider) { self.currentAgent.model_provider = resp.provider; }
-                self.messages.push({ id: ++msgId, role: 'system', text: 'Model switched to: `' + cmdArgs + '`' + (resp && resp.provider ? ' (provider: `' + resp.provider + '`)' : ''), meta: '', tools: [] });
+                // Use server-resolved model/provider (fixes #387/#466)
+                var resolvedModel = (resp && resp.model) || cmdArgs;
+                var resolvedProvider = (resp && resp.provider) || '';
+                self.currentAgent.model_name = resolvedModel;
+                if (resolvedProvider) { self.currentAgent.model_provider = resolvedProvider; }
+                self.messages.push({ id: ++msgId, role: 'system', text: 'Model switched to: `' + resolvedModel + '`' + (resolvedProvider ? ' (provider: `' + resolvedProvider + '`)' : ''), meta: '', tools: [] });
                 self.scrollToBottom();
               }).catch(function(e) { OpenFangToast.error('Model switch failed: ' + e.message); });
             } else {
@@ -502,6 +529,9 @@ function chatPage() {
         });
         localStorage.setItem('of-chat-tips-seen', 'true');
       }
+      // Restore any saved draft for this agent
+      this.restoreDraft();
+
       // Focus input after agent selection
       var self = this;
       this.$nextTick(function() {
@@ -522,12 +552,16 @@ function chatPage() {
             text = self.sanitizeToolText(text);
             // Build tool cards from historical tool data
             var tools = (m.tools || []).map(function(t, idx) {
+              // input may arrive as a JSON object (from serde) or a string (from WS events)
+              var inputStr = t.input
+                ? (typeof t.input === 'string' ? t.input : JSON.stringify(t.input))
+                : '';
               return {
                 id: (t.name || 'tool') + '-hist-' + idx,
                 name: t.name || 'unknown',
                 running: false,
-                expanded: false,
-                input: t.input || '',
+                expanded: true,
+                input: inputStr,
                 result: t.result || '',
                 is_error: !!t.is_error
               };
@@ -593,15 +627,22 @@ function chatPage() {
       OpenFangAPI.wsConnect(agentId, {
         onOpen: function() {
           Alpine.store('app').wsConnected = true;
+          // Clear any reconnecting status message
+          self._wsReconnectMsg = null;
         },
         onMessage: function(data) { self.handleWsMessage(data); },
         onClose: function() {
           Alpine.store('app').wsConnected = false;
           self._wsAgent = null;
+          self._wsReconnectMsg = null;
         },
         onError: function() {
           Alpine.store('app').wsConnected = false;
           self._wsAgent = null;
+        },
+        onReconnecting: function(attempt, maxAttempts, delaySecs) {
+          // Display reconnect status so the user sees the connection is recovering
+          self._wsReconnectMsg = 'Reconnecting (' + attempt + '/' + maxAttempts + ') in ' + delaySecs + 's\u2026';
         }
       });
     },
@@ -646,17 +687,32 @@ function chatPage() {
           // Show tool/phase progress so the user sees the agent is working
           var phaseMsg = this.messages.length ? this.messages[this.messages.length - 1] : null;
           if (phaseMsg && (phaseMsg.thinking || phaseMsg.streaming)) {
-            var detail = data.detail || data.phase || 'Working...';
-            // Context warning: show prominently
+            // Skip phases that have no user-meaningful display text — "streaming"
+            // and "done" are lifecycle signals, not status to show in the chat bubble.
+            if (data.phase === 'streaming' || data.phase === 'done') {
+              break;
+            }
+            // Context warning: show prominently as a separate system message
             if (data.phase === 'context_warning') {
-              this.messages.push({ id: ++msgId, role: 'system', text: detail, meta: '', tools: [] });
+              var cwDetail = data.detail || 'Context limit reached.';
+              this.messages.push({ id: ++msgId, role: 'system', text: cwDetail, meta: '', tools: [] });
             } else if (data.phase === 'thinking' && this.thinkingMode === 'stream') {
               // Stream reasoning tokens to a collapsible panel
               if (!phaseMsg._reasoning) phaseMsg._reasoning = '';
-              phaseMsg._reasoning += (detail || '') + '\n';
+              phaseMsg._reasoning += (data.detail || '') + '\n';
               phaseMsg.text = '<details><summary>Reasoning...</summary>\n\n' + phaseMsg._reasoning + '</details>';
-            } else {
-              phaseMsg.text = detail;
+            } else if (phaseMsg.thinking) {
+              // Only update text on messages still in thinking state (not yet
+              // receiving streamed content) to avoid overwriting accumulated text.
+              var phaseDetail;
+              if (data.phase === 'tool_use') {
+                phaseDetail = 'Using ' + (data.detail || 'tool') + '...';
+              } else if (data.phase === 'thinking') {
+                phaseDetail = 'Thinking...';
+              } else {
+                phaseDetail = data.detail || 'Working...';
+              }
+              phaseMsg.text = phaseDetail;
             }
           }
           this.scrollToBottom();
@@ -684,7 +740,7 @@ function chatPage() {
                   id: toolMatch[1] + '-txt-' + Date.now(),
                   name: toolMatch[1],
                   running: true,
-                  expanded: false,
+                  expanded: true,
                   input: inputMatch ? inputMatch[1].replace(/<\/function>?\s*$/, '').trim() : '',
                   result: '',
                   is_error: false
@@ -702,7 +758,7 @@ function chatPage() {
           var lastMsg = this.messages.length ? this.messages[this.messages.length - 1] : null;
           if (lastMsg && lastMsg.streaming) {
             if (!lastMsg.tools) lastMsg.tools = [];
-            lastMsg.tools.push({ id: data.tool + '-' + Date.now(), name: data.tool, running: true, expanded: false, input: '', result: '', is_error: false });
+            lastMsg.tools.push({ id: data.tool + '-' + Date.now(), name: data.tool, running: true, expanded: true, input: '', result: '', is_error: false });
           }
           this.scrollToBottom();
           break;
@@ -765,8 +821,8 @@ function chatPage() {
           var streamedText = '';
           var streamedTools = [];
           this.messages.forEach(function(m) {
-            if (m.streaming && !m.thinking && m.role === 'agent') {
-              streamedText += m.text || '';
+            if (m.streaming && m.role === 'agent') {
+              if (!m.thinking) streamedText += m.text || '';
               streamedTools = streamedTools.concat(m.tools || []);
             }
           });
@@ -870,6 +926,46 @@ function chatPage() {
       return h + ':' + (m < 10 ? '0' : '') + m + ' ' + ampm;
     },
 
+    // ── Draft auto-save ──────────────────────────────────────────────────
+    // Persists the input text to localStorage per agent so users don't lose
+    // their work on refresh or accidental page close.
+
+    _draftKey: function() {
+      return this.currentAgent ? 'openfang_draft_' + this.currentAgent.id : null;
+    },
+
+    saveDraft: function() {
+      var key = this._draftKey();
+      if (!key) return;
+      if (this.inputText) {
+        localStorage.setItem(key, this.inputText);
+      } else {
+        localStorage.removeItem(key);
+      }
+    },
+
+    restoreDraft: function() {
+      var key = this._draftKey();
+      if (!key) return;
+      var saved = localStorage.getItem(key);
+      if (saved) {
+        this.inputText = saved;
+        this._draftRestored = true;
+        // Auto-hide the "Draft restored" badge after 4 seconds
+        var self = this;
+        setTimeout(function() { self._draftRestored = false; }, 4000);
+      } else {
+        this.inputText = '';
+        this._draftRestored = false;
+      }
+    },
+
+    clearDraft: function() {
+      var key = this._draftKey();
+      if (key) localStorage.removeItem(key);
+      this._draftRestored = false;
+    },
+
     // Copy message text to clipboard
     copyMessage: function(msg) {
       var text = msg.text || '';
@@ -902,6 +998,8 @@ function chatPage() {
       }
 
       this.inputText = '';
+      // Clear saved draft since the message is now being sent
+      this.clearDraft();
 
       // Reset textarea height to single line
       var ta = document.getElementById('msg-input');
@@ -1100,8 +1198,38 @@ function chatPage() {
 
     formatToolJson: function(text) {
       if (!text) return '';
-      try { return JSON.stringify(JSON.parse(text), null, 2); }
-      catch(e) { return text; }
+      try {
+        var obj = typeof text === 'string' ? JSON.parse(text) : text;
+        return JSON.stringify(obj, null, 2);
+      } catch(e) { return typeof text === 'string' ? text : JSON.stringify(text); }
+    },
+
+    // Extract the most meaningful argument from a tool input for timeline display
+    toolArgPreview: function(tool) {
+      if (!tool.input) return '';
+      try {
+        var input = typeof tool.input === 'string' ? JSON.parse(tool.input) : tool.input;
+        if (!input || typeof input !== 'object') return '';
+        var priority = ['path', 'file', 'command', 'query', 'url', 'pattern', 'content', 'message', 'name', 'text'];
+        for (var i = 0; i < priority.length; i++) {
+          var val = input[priority[i]];
+          if (val && typeof val === 'string' && val.trim()) {
+            if (priority[i] === 'path' || priority[i] === 'file') {
+              var parts = val.replace(/\\/g, '/').split('/').filter(Boolean);
+              if (parts.length > 2) val = '…/' + parts.slice(-2).join('/');
+            }
+            return val.length > 48 ? val.substring(0, 46) + '…' : val;
+          }
+        }
+        var keys = Object.keys(input);
+        for (var j = 0; j < keys.length; j++) {
+          var v = input[keys[j]];
+          if (typeof v === 'string' && v.trim()) {
+            return v.length > 48 ? v.substring(0, 46) + '…' : v;
+          }
+        }
+      } catch(e) {}
+      return '';
     },
 
     // Voice: start recording

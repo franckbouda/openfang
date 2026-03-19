@@ -19,7 +19,7 @@
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Tools that are expected to be polled repeatedly.
 const POLL_TOOLS: &[&str] = &[
@@ -110,7 +110,7 @@ pub struct LoopGuard {
     /// Call hashes that are blocked due to repeated identical outcomes.
     blocked_outcomes: HashSet<String>,
     /// Recent tool call hashes (ring buffer of last HISTORY_SIZE).
-    recent_calls: Vec<String>,
+    recent_calls: VecDeque<String>,
     /// Warnings already emitted (to prevent spam). Key = call hash, value = count emitted.
     warnings_emitted: HashMap<String, u32>,
     /// Tracks poll counts per command hash for backoff suggestions.
@@ -130,7 +130,7 @@ impl LoopGuard {
             total_calls: 0,
             outcome_counts: HashMap::new(),
             blocked_outcomes: HashSet::new(),
-            recent_calls: Vec::with_capacity(HISTORY_SIZE),
+            recent_calls: VecDeque::with_capacity(HISTORY_SIZE),
             warnings_emitted: HashMap::new(),
             poll_counts: HashMap::new(),
             blocked_calls: 0,
@@ -163,9 +163,9 @@ impl LoopGuard {
 
         // Track recent calls for ping-pong detection
         if self.recent_calls.len() >= HISTORY_SIZE {
-            self.recent_calls.remove(0);
+            self.recent_calls.pop_front();
         }
-        self.recent_calls.push(hash.clone());
+        self.recent_calls.push_back(hash.clone());
 
         // Check if this call hash was blocked by outcome detection
         if self.blocked_outcomes.contains(&hash) {
@@ -336,18 +336,17 @@ impl LoopGuard {
         if POLL_TOOLS.contains(&tool_name) {
             if let Some(cmd) = params.get("command").and_then(|v| v.as_str()) {
                 let cmd_lower = cmd.to_lowercase();
-                // Short commands that explicitly check status/wait/poll
-                if cmd.len() < 50
-                    && (cmd_lower.contains("status")
-                        || cmd_lower.contains("poll")
-                        || cmd_lower.contains("wait")
-                        || cmd_lower.contains("watch")
-                        || cmd_lower.contains("tail")
-                        || cmd_lower.contains("ps ")
-                        || cmd_lower.contains("jobs")
-                        || cmd_lower.contains("pgrep")
-                        || cmd_lower.contains("docker ps")
-                        || cmd_lower.contains("kubectl get"))
+                // Commands that explicitly check status/wait/poll
+                if cmd_lower.contains("status")
+                    || cmd_lower.contains("poll")
+                    || cmd_lower.contains("wait")
+                    || cmd_lower.contains("watch")
+                    || cmd_lower.contains("tail")
+                    || cmd_lower.contains("ps ")
+                    || cmd_lower.contains("jobs")
+                    || cmd_lower.contains("pgrep")
+                    || cmd_lower.contains("docker ps")
+                    || cmd_lower.contains("kubectl get")
                 {
                     return true;
                 }
@@ -375,15 +374,16 @@ impl LoopGuard {
 
     /// Shared ping-pong detection implementation.
     fn detect_ping_pong_impl(&self) -> Option<String> {
-        let len = self.recent_calls.len();
+        let calls: Vec<&String> = self.recent_calls.iter().collect();
+        let len = calls.len();
 
         // Check for pattern of length 2 (A-B-A-B-A-B)
         // Need at least 6 entries for 3 repeats of length 2
         if len >= 6 {
-            let tail = &self.recent_calls[len - 6..];
-            let a = &tail[0];
-            let b = &tail[1];
-            if a != b && tail[2] == *a && tail[3] == *b && tail[4] == *a && tail[5] == *b {
+            let tail = &calls[len - 6..];
+            let a = tail[0];
+            let b = tail[1];
+            if a != b && tail[2] == a && tail[3] == b && tail[4] == a && tail[5] == b {
                 let tool_a = self
                     .hash_to_tool
                     .get(a)
@@ -405,18 +405,18 @@ impl LoopGuard {
         // Check for pattern of length 3 (A-B-C-A-B-C-A-B-C)
         // Need at least 9 entries for 3 repeats of length 3
         if len >= 9 {
-            let tail = &self.recent_calls[len - 9..];
-            let a = &tail[0];
-            let b = &tail[1];
-            let c = &tail[2];
+            let tail = &calls[len - 9..];
+            let a = tail[0];
+            let b = tail[1];
+            let c = tail[2];
             // Ensure they're not all the same (that's just repetition, not ping-pong)
             if !(a == b && b == c)
-                && tail[3] == *a
-                && tail[4] == *b
-                && tail[5] == *c
-                && tail[6] == *a
-                && tail[7] == *b
-                && tail[8] == *c
+                && tail[3] == a
+                && tail[4] == b
+                && tail[5] == c
+                && tail[6] == a
+                && tail[7] == b
+                && tail[8] == c
             {
                 let tool_a = self
                     .hash_to_tool
@@ -447,18 +447,19 @@ impl LoopGuard {
     /// Count how many full repeats of the detected ping-pong pattern exist
     /// in the recent call history.
     fn count_ping_pong_repeats(&self) -> u32 {
-        let len = self.recent_calls.len();
+        let calls: Vec<&String> = self.recent_calls.iter().collect();
+        let len = calls.len();
 
         // Check pattern of length 2
         if len >= 4 {
-            let a = &self.recent_calls[len - 2];
-            let b = &self.recent_calls[len - 1];
+            let a = calls[len - 2];
+            let b = calls[len - 1];
             if a != b {
                 let mut repeats: u32 = 0;
                 let mut i = len;
                 while i >= 2 {
                     i -= 2;
-                    if self.recent_calls[i] == *a && self.recent_calls[i + 1] == *b {
+                    if calls[i] == a && calls[i + 1] == b {
                         repeats += 1;
                     } else {
                         break;
@@ -472,18 +473,15 @@ impl LoopGuard {
 
         // Check pattern of length 3
         if len >= 6 {
-            let a = &self.recent_calls[len - 3];
-            let b = &self.recent_calls[len - 2];
-            let c = &self.recent_calls[len - 1];
+            let a = calls[len - 3];
+            let b = calls[len - 2];
+            let c = calls[len - 1];
             if !(a == b && b == c) {
                 let mut repeats: u32 = 0;
                 let mut i = len;
                 while i >= 3 {
                     i -= 3;
-                    if self.recent_calls[i] == *a
-                        && self.recent_calls[i + 1] == *b
-                        && self.recent_calls[i + 2] == *c
-                    {
+                    if calls[i] == a && calls[i + 1] == b && calls[i + 2] == c {
                         repeats += 1;
                     } else {
                         break;
@@ -504,7 +502,8 @@ impl LoopGuard {
         hasher.update(tool_name.as_bytes());
         hasher.update(b"|");
         // Serialize params deterministically (serde_json sorts object keys)
-        let params_str = serde_json::to_string(params).unwrap_or_default();
+        let params_str = serde_json::to_string(params)
+                .unwrap_or_else(|_| format!("<unserializable:{}>", tool_name));
         hasher.update(params_str.as_bytes());
         hex::encode(hasher.finalize())
     }
@@ -517,7 +516,8 @@ impl LoopGuard {
         let mut hasher = Sha256::new();
         hasher.update(tool_name.as_bytes());
         hasher.update(b"|");
-        let params_str = serde_json::to_string(params).unwrap_or_default();
+        let params_str = serde_json::to_string(params)
+                .unwrap_or_else(|_| format!("<unserializable:{}>", tool_name));
         hasher.update(params_str.as_bytes());
         hasher.update(b"|");
         let truncated = crate::str_utils::safe_truncate_str(result, 1000);
@@ -767,7 +767,7 @@ mod tests {
             &serde_json::json!({"command": "echo hi"})
         ));
 
-        // shell_exec with long command — NOT a poll
+        // shell_exec with no poll keywords — NOT a poll
         assert!(!LoopGuard::is_poll_call(
             "shell_exec",
             &serde_json::json!({"command": "this is a very long command that definitely exceeds fifty characters in length"})

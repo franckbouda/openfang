@@ -248,8 +248,12 @@ impl AgentRegistry {
 
     /// Update an agent's name (also updates the name index).
     pub fn update_name(&self, id: AgentId, new_name: String) -> OpenFangResult<()> {
-        if self.name_index.contains_key(&new_name) {
-            return Err(OpenFangError::AgentAlreadyExists(new_name));
+        if let Some(existing_id) = self.name_index.get(&new_name).as_deref().copied() {
+            if existing_id != id {
+                return Err(OpenFangError::AgentAlreadyExists(new_name));
+            }
+            // Same agent owns this name — no-op
+            return Ok(());
         }
         let mut entry = self
             .agents
@@ -284,6 +288,7 @@ impl AgentRegistry {
         hourly: Option<f64>,
         daily: Option<f64>,
         monthly: Option<f64>,
+        tokens_per_hour: Option<u64>,
     ) -> OpenFangResult<()> {
         let mut entry = self
             .agents
@@ -297,6 +302,9 @@ impl AgentRegistry {
         }
         if let Some(v) = monthly {
             entry.manifest.resources.max_cost_per_month_usd = v;
+        }
+        if let Some(v) = tokens_per_hour {
+            entry.manifest.resources.max_llm_tokens_per_hour = v;
         }
         entry.last_active = chrono::Utc::now();
         Ok(())

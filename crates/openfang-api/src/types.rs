@@ -2,11 +2,16 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Request to spawn an agent from a TOML manifest string.
+/// Request to spawn an agent from a TOML manifest string or a template name.
 #[derive(Debug, Deserialize)]
 pub struct SpawnRequest {
-    /// Agent manifest as TOML string.
+    /// Agent manifest as TOML string (optional if `template` is provided).
+    #[serde(default)]
     pub manifest_toml: String,
+    /// Template name from `~/.openfang/agents/{template}/agent.toml`.
+    /// When provided and `manifest_toml` is empty, the template is loaded automatically.
+    #[serde(default)]
+    pub template: Option<String>,
     /// Optional Ed25519 signed manifest envelope (JSON).
     /// When present, the signature is verified before spawning.
     #[serde(default)]
@@ -37,6 +42,12 @@ pub struct MessageRequest {
     /// Optional file attachments (uploaded via /upload endpoint).
     #[serde(default)]
     pub attachments: Vec<AttachmentRef>,
+    /// Sender identity (e.g. WhatsApp phone number, Telegram user ID).
+    #[serde(default)]
+    pub sender_id: Option<String>,
+    /// Sender display name.
+    #[serde(default)]
+    pub sender_name: Option<String>,
 }
 
 /// Response from sending a message.
@@ -95,4 +106,54 @@ pub struct MigrateScanRequest {
 pub struct ClawHubInstallRequest {
     /// ClawHub skill slug (e.g., "github-helper").
     pub slug: String,
+}
+
+/// Unified error response for all API error cases.
+///
+/// Use this struct to return structured, machine-readable errors to API clients.
+/// Fields:
+/// - `error`: Human-readable error message.
+/// - `error_code`: Optional short code for the error category (e.g. "rate_limit", "billing").
+/// - `retryable`: Whether the client can retry the request (e.g. after a delay).
+/// - `details`: Optional additional context (arbitrary JSON).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ErrorResponse {
+    pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+impl ErrorResponse {
+    /// Create a simple non-retryable error with no code.
+    pub fn simple(msg: impl Into<String>) -> Self {
+        Self {
+            error: msg.into(),
+            error_code: None,
+            retryable: false,
+            details: None,
+        }
+    }
+
+    /// Create an error with a short error code.
+    pub fn with_code(msg: impl Into<String>, code: impl Into<String>) -> Self {
+        Self {
+            error: msg.into(),
+            error_code: Some(code.into()),
+            retryable: false,
+            details: None,
+        }
+    }
+
+    /// Create a retryable error (e.g. rate limit).
+    pub fn retryable(msg: impl Into<String>) -> Self {
+        Self {
+            error: msg.into(),
+            error_code: None,
+            retryable: true,
+            details: None,
+        }
+    }
 }

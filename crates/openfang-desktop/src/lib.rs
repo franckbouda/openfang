@@ -14,6 +14,8 @@ use openfang_kernel::OpenFangKernel;
 use openfang_types::event::{EventPayload, LifecycleEvent, SystemEvent};
 use std::sync::Arc;
 use std::time::Instant;
+#[allow(unused_imports)]
+// Manager is used via get_webview_window — rustc doesn't detect it as "used"
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_notification::NotificationExt;
 use tracing::{info, warn};
@@ -43,6 +45,7 @@ pub fn run() {
     // Boot kernel + embedded server (blocks until port is known)
     let server_handle = server::start_server().expect("Failed to start OpenFang server");
     let port = server_handle.port;
+    let vault_display_key = server_handle.vault_display_key.clone();
     let kernel_for_notifications = server_handle.kernel.clone();
 
     info!("OpenFang server running on port {port}");
@@ -57,14 +60,20 @@ pub fn run() {
     // Desktop-only plugins
     #[cfg(desktop)]
     {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // Another instance tried to launch — focus the existing window
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.unminimize();
-                let _ = w.set_focus();
-            }
-        }));
+        // Single-instance enforcement is only active in release builds.
+        // In debug mode (cargo tauri dev), multiple instances are allowed so
+        // a dev instance and a release build can run simultaneously on the same Mac.
+        #[cfg(not(debug_assertions))]
+        {
+            builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+                // Another instance tried to launch — focus the existing window
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.unminimize();
+                    let _ = w.set_focus();
+                }
+            }));
+        }
 
         builder = builder.plugin(
             tauri_plugin_autostart::Builder::new()
@@ -105,6 +114,19 @@ pub fn run() {
             commands::open_logs_dir,
         ])
         .setup(move |app| {
+            // Show vault master key dialog if newly created
+            if let Some(ref key) = vault_display_key {
+                use tauri_plugin_dialog::DialogExt;
+                let msg = format!(
+                    "Le vault OpenFang vient d'être créé.\n\nSauvegarde cette clé maître dans un endroit sûr :\n\n{}\n\nPour restaurer l'accès sur une nouvelle machine :\nOPENFANG_VAULT_KEY=<clé>",
+                    key
+                );
+                app.dialog()
+                    .message(msg)
+                    .title("Clé Vault — À Sauvegarder !")
+                    .blocking_show();
+            }
+
             // Create the main window pointing directly at the embedded HTTP server.
             // We do NOT define windows in tauri.conf.json because Tauri would try to
             // load index.html from embedded assets (which don't exist), causing a race

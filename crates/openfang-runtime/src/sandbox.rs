@@ -263,7 +263,10 @@ impl WasmSandbox {
             .map_err(|e| SandboxError::AbiError(format!("Invalid JSON output from guest: {e}")))?;
 
         // Calculate fuel consumed
-        let fuel_remaining = store.get_fuel().unwrap_or(0);
+        let fuel_remaining = store.get_fuel().unwrap_or_else(|e| {
+            tracing::warn!(agent = agent_id, "get_fuel() failed: {e} — reporting 0 fuel remaining");
+            0
+        });
         let fuel_consumed = config.fuel_limit.saturating_sub(fuel_remaining);
 
         debug!(agent = agent_id, fuel_consumed, "WASM execution complete");

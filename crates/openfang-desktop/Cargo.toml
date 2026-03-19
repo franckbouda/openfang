@@ -12,6 +12,7 @@ tauri-build = { version = "2", features = [] }
 openfang-kernel = { path = "../openfang-kernel" }
 openfang-api = { path = "../openfang-api" }
 openfang-types = { path = "../openfang-types" }
+openfang-extensions = { path = "../openfang-extensions" }
 tokio = { workspace = true }
 axum = { workspace = true }
 serde_json = { workspace = true }
