@@ -236,10 +236,7 @@ impl LlmDriver for AnthropicDriver {
             }
 
             if !resp.status().is_success() {
-                let body = resp
-                    .text()
-                    .await
-                    .unwrap_or_else(|e| format!("(failed to read response: {e})"));
+                let body = resp.text().await.unwrap_or_default();
                 let message = serde_json::from_str::<ApiErrorResponse>(&body)
                     .map(|e| e.error.message)
                     .unwrap_or(body);
@@ -346,10 +343,7 @@ impl LlmDriver for AnthropicDriver {
             }
 
             if !resp.status().is_success() {
-                let body = resp
-                    .text()
-                    .await
-                    .unwrap_or_else(|e| format!("(failed to read response: {e})"));
+                let body = resp.text().await.unwrap_or_default();
                 let message = serde_json::from_str::<ApiErrorResponse>(&body)
                     .map(|e| e.error.message)
                     .unwrap_or(body);
@@ -477,13 +471,9 @@ impl LlmDriver for AnthropicDriver {
                                 input_json,
                             }) = blocks.get(block_idx)
                             {
-                                let input: serde_json::Value = serde_json::from_str(input_json)
-                                    .map_err(|e| {
-                                        LlmError::Parse(format!(
-                                            "Invalid tool arguments for '{}': {}",
-                                            name, e
-                                        ))
-                                    })?;
+                                let input: serde_json::Value =
+                                    serde_json::from_str(input_json)
+                                        .unwrap_or_else(|_| serde_json::json!({}));
                                 let _ = tx
                                     .send(StreamEvent::ToolUseEnd {
                                         id: id.clone(),
@@ -532,12 +522,7 @@ impl LlmDriver for AnthropicDriver {
                         input_json,
                     } => {
                         let input: serde_json::Value =
-                            serde_json::from_str(&input_json).map_err(|e| {
-                                LlmError::Parse(format!(
-                                    "Invalid tool arguments for '{}': {}",
-                                    name, e
-                                ))
-                            })?;
+                            serde_json::from_str(&input_json).unwrap_or_default();
                         content.push(ContentBlock::ToolUse {
                             id: id.clone(),
                             name: name.clone(),

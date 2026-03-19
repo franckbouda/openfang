@@ -358,21 +358,24 @@ pub async fn send_message(
         );
     }
 
-    // Resolve file attachments into image content blocks
-    if !req.attachments.is_empty() {
+    // Resolve file attachments into image content blocks.
+    // Pass them as content_blocks so the LLM receives them in the current turn
+    // (not as a separate session message which the LLM may not process).
+    let content_blocks = if !req.attachments.is_empty() {
         let image_blocks = resolve_attachments(&req.attachments);
-        if !image_blocks.is_empty() {
-            inject_attachments_into_session(&state.kernel, agent_id, image_blocks);
-        }
-    }
+        if image_blocks.is_empty() { None } else { Some(image_blocks) }
+    } else {
+        None
+    };
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
     match state
         .kernel
-        .send_message_with_handle(
+        .send_message_with_handle_and_blocks(
             agent_id,
             &req.message,
             Some(kernel_handle),
+            content_blocks,
             req.sender_id,
             req.sender_name,
         )
@@ -382,8 +385,11 @@ pub async fn send_message(
             // Strip <think>...</think> blocks from model output
             let cleaned = crate::ws::strip_think_tags(&result.response);
 
-            // Guard: ensure we never return an empty response to the client
-            let response = if cleaned.trim().is_empty() {
+            // If the agent intentionally returned a silent/NO_REPLY response,
+            // return an empty string — don't generate debug fallback text.
+            let response = if result.silent {
+                String::new()
+            } else if cleaned.trim().is_empty() {
                 format!(
                     "[The agent completed processing but returned no text response. ({} in / {} out | {} iter)]",
                     result.total_usage.input_tokens,
@@ -640,6 +646,67 @@ pub async fn kill_agent(
             )
         }
     }
+}
+
+/// POST /api/agents/{id}/restart — Restart a crashed/stuck agent.
+///
+/// Cancels any active task, resets agent state to Running, and updates last_active.
+/// Returns the agent's new state.
+pub async fn restart_agent(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
+
+    // Check agent exists
+    let entry = match state.kernel.registry.get(agent_id) {
+        Some(e) => e,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Agent not found"})),
+            );
+        }
+    };
+
+    let agent_name = entry.name.clone();
+    let previous_state = format!("{:?}", entry.state);
+    drop(entry);
+
+    // Cancel any running task
+    let was_running = state.kernel.stop_agent_run(agent_id).unwrap_or(false);
+
+    // Reset state to Running (also updates last_active)
+    let _ = state
+        .kernel
+        .registry
+        .set_state(agent_id, openfang_types::agent::AgentState::Running);
+
+    tracing::info!(
+        agent = %agent_name,
+        previous_state = %previous_state,
+        task_cancelled = was_running,
+        "Agent restarted via API"
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "restarted",
+            "agent": agent_name,
+            "agent_id": id,
+            "previous_state": previous_state,
+            "task_cancelled": was_running,
+        })),
+    )
 }
 
 /// GET /api/status — Kernel status.
@@ -1348,6 +1415,7 @@ pub async fn send_message_stream(
         Some(kernel_handle),
         req.sender_id,
         req.sender_name,
+        None, // SSE streaming doesn't support image attachments yet
     ) {
         Ok(pair) => pair,
         Err(e) => {
@@ -1786,18 +1854,23 @@ const CHANNEL_REGISTRY: &[ChannelMeta] = &[
     },
     ChannelMeta {
         name: "feishu", display_name: "Feishu/Lark", icon: "FS",
-        description: "Feishu/Lark Open Platform adapter",
+        description: "Feishu/Lark Open Platform adapter (supports China & International)",
         category: "enterprise", difficulty: "Easy", setup_time: "~3 min",
         quick_setup: "Paste your App ID and App Secret",
         setup_type: "form",
         fields: &[
             ChannelField { key: "app_id", label: "App ID", field_type: FieldType::Text, env_var: None, required: true, placeholder: "cli_abc123", advanced: false },
             ChannelField { key: "app_secret_env", label: "App Secret", field_type: FieldType::Secret, env_var: Some("FEISHU_APP_SECRET"), required: true, placeholder: "abc123...", advanced: false },
+            ChannelField { key: "region", label: "Region", field_type: FieldType::Text, env_var: None, required: false, placeholder: "cn or intl", advanced: false },
             ChannelField { key: "webhook_port", label: "Webhook Port", field_type: FieldType::Number, env_var: None, required: false, placeholder: "8453", advanced: true },
+            ChannelField { key: "webhook_path", label: "Webhook Path", field_type: FieldType::Text, env_var: None, required: false, placeholder: "/feishu/webhook", advanced: true },
+            ChannelField { key: "verification_token", label: "Verification Token", field_type: FieldType::Text, env_var: None, required: false, placeholder: "verify-token", advanced: true },
+            ChannelField { key: "encrypt_key_env", label: "Encrypt Key", field_type: FieldType::Secret, env_var: Some("FEISHU_ENCRYPT_KEY"), required: false, placeholder: "encrypt-key", advanced: true },
+            ChannelField { key: "bot_names", label: "Bot Names", field_type: FieldType::List, env_var: None, required: false, placeholder: "MyBot, Assistant", advanced: true },
             ChannelField { key: "default_agent", label: "Default Agent", field_type: FieldType::Text, env_var: None, required: false, placeholder: "assistant", advanced: true },
         ],
-        setup_steps: &["Create an app at open.feishu.cn", "Copy App ID and Secret", "Paste them below"],
-        config_template: "[channels.feishu]\napp_id = \"\"\napp_secret_env = \"FEISHU_APP_SECRET\"",
+        setup_steps: &["Create an app at open.feishu.cn (CN) or open.larksuite.com (International)", "Copy App ID and Secret", "Set region: cn (Feishu) or intl (Lark)"],
+        config_template: "[channels.feishu]\napp_id = \"\"\napp_secret_env = \"FEISHU_APP_SECRET\"\nregion = \"cn\"",
     },
     ChannelMeta {
         name: "dingtalk", display_name: "DingTalk", icon: "DT",
@@ -1813,6 +1886,21 @@ const CHANNEL_REGISTRY: &[ChannelMeta] = &[
         ],
         setup_steps: &["Create a robot in your DingTalk group", "Copy the token and signing secret", "Paste them below"],
         config_template: "[channels.dingtalk]\naccess_token_env = \"DINGTALK_ACCESS_TOKEN\"\nsecret_env = \"DINGTALK_SECRET\"",
+    },
+    ChannelMeta {
+        name: "dingtalk_stream", display_name: "DingTalk Stream", icon: "DS",
+        description: "DingTalk Stream Mode (WebSocket long-connection)",
+        category: "enterprise", difficulty: "Easy", setup_time: "~5 min",
+        quick_setup: "Create an Enterprise Internal App with Stream Mode enabled",
+        setup_type: "form",
+        fields: &[
+            ChannelField { key: "app_key_env", label: "App Key", field_type: FieldType::Secret, env_var: Some("DINGTALK_APP_KEY"), required: true, placeholder: "ding...", advanced: false },
+            ChannelField { key: "app_secret_env", label: "App Secret", field_type: FieldType::Secret, env_var: Some("DINGTALK_APP_SECRET"), required: true, placeholder: "uAn4...", advanced: false },
+            ChannelField { key: "robot_code_env", label: "Robot Code", field_type: FieldType::Text, env_var: Some("DINGTALK_ROBOT_CODE"), required: false, placeholder: "ding... (same as App Key)", advanced: true },
+            ChannelField { key: "default_agent", label: "Default Agent", field_type: FieldType::Text, env_var: None, required: false, placeholder: "assistant", advanced: true },
+        ],
+        setup_steps: &["Create an Enterprise Internal App in DingTalk Open Platform", "Enable Stream Mode in the app settings", "Add robot capability and configure permissions", "Copy App Key and App Secret below"],
+        config_template: "[channels.dingtalk_stream]\napp_key_env = \"DINGTALK_APP_KEY\"\napp_secret_env = \"DINGTALK_APP_SECRET\"",
     },
     ChannelMeta {
         name: "pumble", display_name: "Pumble", icon: "PB",
@@ -2075,6 +2163,24 @@ const CHANNEL_REGISTRY: &[ChannelMeta] = &[
         setup_steps: &["Enter host and username below", "Optionally add a password"],
         config_template: "[channels.mumble]\nhost = \"\"\nusername = \"openfang\"",
     },
+    ChannelMeta {
+        name: "wecom", display_name: "WeCom", icon: "WC",
+        description: "WeCom (WeChat Work) adapter",
+        category: "messaging", difficulty: "Easy", setup_time: "~3 min",
+        quick_setup: "Enter your Corp ID, Agent ID, and Secret",
+        setup_type: "form",
+        fields: &[
+            ChannelField { key: "corp_id", label: "Corp ID", field_type: FieldType::Text, env_var: None, required: true, placeholder: "wwxxxxx", advanced: false },
+            ChannelField { key: "agent_id", label: "Agent ID", field_type: FieldType::Text, env_var: None, required: true, placeholder: "wwxxxxx", advanced: false },
+            ChannelField { key: "secret_env", label: "Secret", field_type: FieldType::Secret, env_var: Some("WECOM_SECRET"), required: true, placeholder: "secret", advanced: false },
+            ChannelField { key: "token", label: "Callback Token", field_type: FieldType::Text, env_var: None, required: false, placeholder: "callback_token", advanced: true },
+            ChannelField { key: "encoding_aes_key", label: "Encoding AES Key", field_type: FieldType::Text, env_var: None, required: false, placeholder: "encoding_aes_key", advanced: true },
+            ChannelField { key: "webhook_port", label: "Webhook Port", field_type: FieldType::Number, env_var: None, required: false, placeholder: "8454", advanced: true },
+            ChannelField { key: "default_agent", label: "Default Agent", field_type: FieldType::Text, env_var: None, required: false, placeholder: "assistant", advanced: true },
+        ],
+        setup_steps: &["Create a WeCom application at work.weixin.qq.com", "Get Corp ID, Agent ID, and Secret", "Configure callback URL to your webhook endpoint"],
+        config_template: "[channels.wecom]\ncorp_id = \"\"\nagent_id = \"\"\nsecret_env = \"WECOM_SECRET\"",
+    },
 ];
 
 /// Check if a channel is configured (has a `[channels.xxx]` section in config).
@@ -2103,6 +2209,7 @@ fn is_channel_configured(config: &openfang_types::config::ChannelsConfig, name: 
         "webex" => config.webex.is_some(),
         "feishu" => config.feishu.is_some(),
         "dingtalk" => config.dingtalk.is_some(),
+        "dingtalk_stream" => config.dingtalk_stream.is_some(),
         "pumble" => config.pumble.is_some(),
         "flock" => config.flock.is_some(),
         "twist" => config.twist.is_some(),
@@ -2120,6 +2227,7 @@ fn is_channel_configured(config: &openfang_types::config::ChannelsConfig, name: 
         "gotify" => config.gotify.is_some(),
         "webhook" => config.webhook.is_some(),
         "mumble" => config.mumble.is_some(),
+        "wecom" => config.wecom.is_some(),
         _ => false,
     }
 }
@@ -2325,6 +2433,10 @@ fn channel_config_values(
             .dingtalk
             .as_ref()
             .and_then(|c| serde_json::to_value(c).ok()),
+        "dingtalk_stream" => config
+            .dingtalk_stream
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
         "discourse" => config
             .discourse
             .as_ref()
@@ -2347,6 +2459,10 @@ fn channel_config_values(
             .and_then(|c| serde_json::to_value(c).ok()),
         "linkedin" => config
             .linkedin
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
+        "wecom" => config
+            .wecom
             .as_ref()
             .and_then(|c| serde_json::to_value(c).ok()),
         _ => None,
@@ -2458,7 +2574,10 @@ pub async fn configure_channel(
                     Json(serde_json::json!({"error": format!("Failed to write secret: {e}")})),
                 );
             }
-            openfang_types::set_env_var(env_var, value);
+            // SAFETY: We are the only writer; this is a single-threaded config operation
+            unsafe {
+                std::env::set_var(env_var, value);
+            }
             // Also write the env var NAME to config.toml so the channel section
             // is not empty and the kernel knows which env var to read.
             config_fields.insert(
@@ -3459,12 +3578,14 @@ pub async fn clawhub_search(
     let cache_dir = state.kernel.config.home_dir.join(".cache").join("clawhub");
     let client = openfang_skills::clawhub::ClawHubClient::new(cache_dir);
 
+    let skills_dir = state.kernel.config.home_dir.join("skills");
     match client.search(&query, limit).await {
         Ok(results) => {
             let items: Vec<serde_json::Value> = results
                 .results
                 .iter()
                 .map(|e| {
+                    let installed = skills_dir.join(&e.slug).exists();
                     serde_json::json!({
                         "slug": e.slug,
                         "name": e.display_name,
@@ -3472,6 +3593,7 @@ pub async fn clawhub_search(
                         "version": e.version,
                         "score": e.score,
                         "updated_at": e.updated_at,
+                        "installed": installed,
                     })
                 })
                 .collect();
@@ -3536,12 +3658,18 @@ pub async fn clawhub_browse(
     let cache_dir = state.kernel.config.home_dir.join(".cache").join("clawhub");
     let client = openfang_skills::clawhub::ClawHubClient::new(cache_dir);
 
+    let skills_dir = state.kernel.config.home_dir.join("skills");
     match client.browse(sort, limit, cursor).await {
         Ok(results) => {
             let items: Vec<serde_json::Value> = results
                 .items
                 .iter()
-                .map(clawhub_browse_entry_to_json)
+                .map(|entry| {
+                    let mut json = clawhub_browse_entry_to_json(entry);
+                    let installed = skills_dir.join(&entry.slug).exists();
+                    json["installed"] = serde_json::json!(installed);
+                    json
+                })
                 .collect();
             let resp = serde_json::json!({
                 "items": items,
@@ -4182,7 +4310,7 @@ pub async fn install_hand_deps(
                 if !extra_paths.is_empty() {
                     let current_path = std::env::var("PATH").unwrap_or_default();
                     let new_path = format!("{};{}", extra_paths.join(";"), current_path);
-                    openfang_types::set_env_var("PATH", &new_path);
+                    std::env::set_var("PATH", &new_path);
                     tracing::info!(
                         added = extra_paths.len(),
                         "Refreshed PATH with winget/pip directories"
@@ -6010,47 +6138,19 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
         });
 
         // For local providers, attach the probe result
-        if let Some(_probe) = probe_map.remove(&i) {
+        if let Some(probe) = probe_map.remove(&i) {
             entry["is_local"] = serde_json::json!(true);
-
-            // Claude Code CLI: detect binary instead of HTTP probe
-            if p.id == "claude-code" {
-                let cli_path =
-                    openfang_runtime::drivers::claude_code::ClaudeCodeDriver::new(None, false)
-                        .cli_path()
-                        .to_string();
-                let detected = std::path::Path::new(&cli_path).exists() || cli_path != "claude";
-                entry["cli_detected"] = serde_json::json!(detected);
-                entry["cli_path"] = serde_json::json!(cli_path);
-                // Version info (non-blocking best-effort)
-                if detected {
-                    let version = std::process::Command::new(&cli_path)
-                        .arg("--version")
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::null())
-                        .output()
-                        .ok()
-                        .filter(|o| o.status.success())
-                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-                    if let Some(v) = version {
-                        entry["cli_version"] = serde_json::json!(v);
-                    }
+            entry["reachable"] = serde_json::json!(probe.reachable);
+            entry["latency_ms"] = serde_json::json!(probe.latency_ms);
+            if !probe.discovered_models.is_empty() {
+                entry["discovered_models"] = serde_json::json!(probe.discovered_models);
+                // Merge discovered models into the catalog so agents can use them
+                if let Ok(mut catalog) = state.kernel.model_catalog.write() {
+                    catalog.merge_discovered_models(&p.id, &probe.discovered_models);
                 }
-            } else {
-                let probe =
-                    openfang_runtime::provider_health::probe_provider(&p.id, &p.base_url).await;
-                entry["reachable"] = serde_json::json!(probe.reachable);
-                entry["latency_ms"] = serde_json::json!(probe.latency_ms);
-                if !probe.discovered_models.is_empty() {
-                    entry["discovered_models"] = serde_json::json!(probe.discovered_models);
-                    // Merge discovered models into the catalog so agents can use them
-                    if let Ok(mut catalog) = state.kernel.model_catalog.write() {
-                        catalog.merge_discovered_models(&p.id, &probe.discovered_models);
-                    }
-                }
-                if let Some(err) = &probe.error {
-                    entry["error"] = serde_json::json!(err);
-                }
+            }
+            if let Some(err) = &probe.error {
+                entry["error"] = serde_json::json!(err);
             }
         } else if !p.key_required {
             // Local provider with empty base_url (e.g. claude-code) — skip probing
@@ -7191,7 +7291,7 @@ pub async fn set_provider_key(
     }
 
     // Set env var in current process so detect_auth picks it up
-    openfang_types::set_env_var(&env_var, &key);
+    std::env::set_var(&env_var, &key);
 
     // Refresh auth detection
     state
@@ -10533,7 +10633,7 @@ pub async fn copilot_oauth_poll(
             }
 
             // Set in current process
-            openfang_types::set_env_var("GITHUB_TOKEN", access_token.as_str());
+            std::env::set_var("GITHUB_TOKEN", access_token.as_str());
 
             // Refresh auth detection
             state
@@ -10994,102 +11094,6 @@ pub async fn comms_task(
     }
 }
 
-/// GET /api/rate-limit/status — Return current rate limit configuration.
-///
-/// Returns the quota limit, window size, and per-operation costs so clients
-/// can display or enforce rate limit awareness without hitting a 429.
-pub async fn get_rate_limit_status(_state: State<Arc<AppState>>) -> impl IntoResponse {
-    use crate::rate_limiter::operation_cost;
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "limit": 500,
-            "window_seconds": 60,
-            "costs": {
-                "health": operation_cost("GET", "/api/health").get(),
-                "list_agents": operation_cost("GET", "/api/agents").get(),
-                "spawn_agent": operation_cost("POST", "/api/agents").get(),
-                "send_message": operation_cost("POST", "/api/agents/x/message").get(),
-                "run_workflow": operation_cost("POST", "/api/workflows/x/run").get(),
-                "install_skill": operation_cost("POST", "/api/skills/install").get(),
-                "migrate": operation_cost("POST", "/api/migrate").get(),
-                "default": operation_cost("GET", "/api/unknown").get(),
-            }
-        })),
-    )
-}
-
-/// GET /api/providers/health — Return health status of all configured providers.
-///
-/// Probes each local/key-free provider and returns reachability, latency, and
-/// any error encountered. Cloud providers are listed as unchecked (require auth).
-pub async fn get_providers_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let provider_list: Vec<openfang_types::model_catalog::ProviderInfo> = {
-        let catalog = state
-            .kernel
-            .model_catalog
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        catalog.list_providers().to_vec()
-    };
-
-    let mut results: Vec<serde_json::Value> = Vec::with_capacity(provider_list.len());
-
-    for p in &provider_list {
-        if !p.key_required {
-            // Local provider — probe it
-            if p.id == "claude-code" {
-                let cli_path =
-                    openfang_runtime::drivers::claude_code::ClaudeCodeDriver::new(None, false)
-                        .cli_path()
-                        .to_string();
-                let detected = std::path::Path::new(&cli_path).exists();
-                let mut entry = serde_json::json!({
-                    "provider": p.id,
-                    "display_name": p.display_name,
-                    "status": if detected { "ok" } else { "unavailable" },
-                    "latency_ms": serde_json::Value::Null,
-                    "local": true,
-                });
-                if !detected {
-                    entry["error"] = serde_json::json!("claude CLI binary not found");
-                }
-                results.push(entry);
-            } else {
-                let probe =
-                    openfang_runtime::provider_health::probe_provider(&p.id, &p.base_url).await;
-                results.push(serde_json::json!({
-                    "provider": p.id,
-                    "display_name": p.display_name,
-                    "status": if probe.reachable { "ok" } else { "unreachable" },
-                    "latency_ms": probe.latency_ms,
-                    "error": probe.error,
-                    "local": true,
-                }));
-            }
-        } else {
-            // Cloud provider — report configured/unconfigured but don't probe
-            let has_key = p.auth_status == openfang_types::model_catalog::AuthStatus::Configured;
-            results.push(serde_json::json!({
-                "provider": p.id,
-                "display_name": p.display_name,
-                "status": if has_key { "configured" } else { "no_key" },
-                "latency_ms": null,
-                "error": null,
-                "local": false,
-            }));
-        }
-    }
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "providers": results,
-            "total": results.len(),
-        })),
-    )
-}
-
 // ── Dashboard Authentication (username/password sessions) ──
 
 /// POST /api/auth/login — Authenticate with username/password, returns session token.
@@ -11264,4 +11268,54 @@ fn remove_toml_section(content: &str, section: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod channel_config_tests {
+    use super::*;
+
+    #[test]
+    fn test_is_channel_configured_wecom_none() {
+        let config = openfang_types::config::ChannelsConfig::default();
+        assert!(!is_channel_configured(&config, "wecom"));
+    }
+
+    #[test]
+    fn test_is_channel_configured_wecom_some() {
+        let mut config = openfang_types::config::ChannelsConfig::default();
+        config.wecom = Some(openfang_types::config::WeComConfig {
+            corp_id: "test_corp".to_string(),
+            agent_id: "test_agent".to_string(),
+            secret_env: "WECOM_SECRET".to_string(),
+            webhook_port: 8454,
+            token: Some("token".to_string()),
+            encoding_aes_key: Some("aes_key".to_string()),
+            default_agent: Some("assistant".to_string()),
+            overrides: openfang_types::config::ChannelOverrides::default(),
+        });
+        assert!(is_channel_configured(&config, "wecom"));
+    }
+
+    #[test]
+    fn test_wecom_in_channel_registry() {
+        let wecom_meta = CHANNEL_REGISTRY.iter().find(|c| c.name == "wecom");
+        assert!(wecom_meta.is_some());
+        let meta = wecom_meta.unwrap();
+        assert_eq!(meta.display_name, "WeCom");
+        assert_eq!(meta.category, "messaging");
+        assert!(
+            meta.fields
+                .iter()
+                .find(|f| f.key == "corp_id")
+                .unwrap()
+                .required
+        );
+        assert!(
+            meta.fields
+                .iter()
+                .find(|f| f.key == "secret_env")
+                .unwrap()
+                .required
+        );
+    }
 }

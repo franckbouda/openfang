@@ -122,6 +122,8 @@ pub async fn build_router(
         .route("/", axum::routing::get(webchat::webchat_page))
         .route("/logo.png", axum::routing::get(webchat::logo_png))
         .route("/favicon.ico", axum::routing::get(webchat::favicon_ico))
+        .route("/manifest.json", axum::routing::get(webchat::manifest_json))
+        .route("/sw.js", axum::routing::get(webchat::sw_js))
         .route(
             "/api/metrics",
             axum::routing::get(routes::prometheus_metrics),
@@ -148,6 +150,14 @@ pub async fn build_router(
             axum::routing::put(routes::set_agent_mode),
         )
         .route("/api/profiles", axum::routing::get(routes::list_profiles))
+        .route(
+            "/api/agents/{id}/restart",
+            axum::routing::post(routes::restart_agent),
+        )
+        .route(
+            "/api/agents/{id}/start",
+            axum::routing::post(routes::restart_agent),
+        )
         .route(
             "/api/agents/{id}/message",
             axum::routing::post(routes::send_message),
@@ -437,17 +447,7 @@ pub async fn build_router(
             axum::routing::get(routes::comms_events_stream),
         )
         .route("/api/comms/send", axum::routing::post(routes::comms_send))
-        .route("/api/comms/task", axum::routing::post(routes::comms_task))
-        // Rate limit status endpoint
-        .route(
-            "/api/rate-limit/status",
-            axum::routing::get(routes::get_rate_limit_status),
-        )
-        // Provider health dashboard endpoint
-        .route(
-            "/api/providers/health",
-            axum::routing::get(routes::get_providers_health),
-        );
+        .route("/api/comms/task", axum::routing::post(routes::comms_task));
 
     // Split into a second router chunk to stay within axum's type nesting limit.
     let app = app

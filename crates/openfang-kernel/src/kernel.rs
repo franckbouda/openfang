@@ -29,7 +29,7 @@ use openfang_runtime::sandbox::{SandboxConfig, WasmSandbox};
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::*;
 use openfang_types::capability::Capability;
-use openfang_types::config::KernelConfig;
+use openfang_types::config::{KernelConfig, OutputFormat};
 use openfang_types::error::OpenFangError;
 use openfang_types::event::*;
 use openfang_types::memory::Memory;
@@ -691,7 +691,7 @@ impl OpenFangKernel {
                         "Fallback provider configured"
                     );
                     driver_chain.push(d.clone());
-                    model_chain.push((d, fb.model.clone()));
+                    model_chain.push((d, strip_provider_prefix(&fb.model, &fb.provider)));
                 }
                 Err(e) => {
                     warn!(
@@ -1085,7 +1085,11 @@ impl OpenFangKernel {
                                             || disk_manifest.model.model
                                                 != entry.manifest.model.model
                                             || disk_manifest.capabilities.tools
-                                                != entry.manifest.capabilities.tools;
+                                                != entry.manifest.capabilities.tools
+                                            || disk_manifest.tool_allowlist
+                                                != entry.manifest.tool_allowlist
+                                            || disk_manifest.tool_blocklist
+                                                != entry.manifest.tool_blocklist;
                                         if changed {
                                             info!(
                                                 agent = %name,
@@ -1254,15 +1258,17 @@ impl OpenFangKernel {
         fixed_id: Option<AgentId>,
     ) -> KernelResult<AgentId> {
         let agent_id = fixed_id.unwrap_or_default();
-        let session_id = SessionId::new();
         let name = manifest.name.clone();
 
         info!(agent = %name, id = %agent_id, parent = ?parent, "Spawning agent");
 
-        // Create session
-        self.memory
+        // Create session — use the returned session_id so the registry
+        // and database are in sync (fixes duplicate session bug #651).
+        let session = self
+            .memory
             .create_session(agent_id)
             .map_err(KernelError::OpenFang)?;
+        let session_id = session.id;
 
         // Inherit kernel exec_policy as fallback if agent manifest doesn't have one
         let mut manifest = manifest;
@@ -1599,6 +1605,7 @@ impl OpenFangKernel {
         kernel_handle: Option<Arc<dyn KernelHandle>>,
         sender_id: Option<String>,
         sender_name: Option<String>,
+        content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
     ) -> KernelResult<(
         tokio::sync::mpsc::Receiver<StreamEvent>,
         tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
@@ -1954,7 +1961,7 @@ impl OpenFangKernel {
                 Some(&kernel_clone.hooks),
                 ctx_window,
                 Some(&kernel_clone.process_manager),
-                None, // content_blocks (streaming path uses text only for now)
+                content_blocks,
             )
             .await;
 
@@ -1992,6 +1999,24 @@ impl OpenFangKernel {
                     kernel_clone
                         .scheduler
                         .record_usage(agent_id, &result.total_usage);
+
+                    // Persist usage to database (same as non-streaming path)
+                    let model = &manifest.model.model;
+                    let cost = MeteringEngine::estimate_cost_with_catalog(
+                        &kernel_clone.model_catalog.read().unwrap_or_else(|e| e.into_inner()),
+                        model,
+                        result.total_usage.input_tokens,
+                        result.total_usage.output_tokens,
+                    );
+                    let _ = kernel_clone.metering.record(&openfang_memory::usage::UsageRecord {
+                        agent_id,
+                        model: model.clone(),
+                        input_tokens: result.total_usage.input_tokens,
+                        output_tokens: result.total_usage.output_tokens,
+                        cost_usd: cost,
+                        tool_calls: result.iterations.saturating_sub(1),
+                    });
+
                     let _ = kernel_clone
                         .registry
                         .set_state(agent_id, AgentState::Running);
@@ -2819,7 +2844,6 @@ impl OpenFangKernel {
                 .get(agent_id)
                 .map(|e| e.manifest.model.base_url.is_some())
                 .unwrap_or(false);
-
             if has_custom_url {
                 // Keep the current provider — don't let auto-detection override
                 // a deliberately configured custom endpoint.
@@ -3259,10 +3283,6 @@ impl OpenFangKernel {
             } else {
                 None
             },
-            // Redundant safety: tool_allowlist mirrors capabilities.tools above.
-            // available_tools() already filters by capabilities.tools, but this
-            // provides defense-in-depth.
-            tool_allowlist: def.tools.clone(),
             tool_blocklist: Vec::new(),
             // Custom profile avoids ToolProfile-based expansion overriding the
             // explicit tool list.
@@ -4288,11 +4308,12 @@ impl OpenFangKernel {
     /// Periodically checks all running agents' last_active timestamps and
     /// publishes `HealthCheckFailed` events for unresponsive agents.
     fn start_heartbeat_monitor(self: &Arc<Self>) {
-        use crate::heartbeat::{check_agents, is_quiet_hours, HeartbeatConfig};
+        use crate::heartbeat::{check_agents, is_quiet_hours, HeartbeatConfig, RecoveryTracker};
 
         let kernel = Arc::clone(self);
         let config = HeartbeatConfig::default();
         let interval_secs = config.check_interval_secs;
+        let recovery_tracker = RecoveryTracker::new();
 
         tokio::spawn(async move {
             let mut interval =
@@ -4319,7 +4340,101 @@ impl OpenFangKernel {
                         }
                     }
 
-                    if status.unresponsive {
+                    // --- Auto-recovery for crashed agents ---
+                    if status.state == AgentState::Crashed {
+                        let failures = recovery_tracker.failure_count(status.agent_id);
+
+                        if failures >= config.max_recovery_attempts {
+                            // Already exhausted recovery attempts — mark Terminated
+                            // (only do this once, check current state)
+                            if let Some(entry) = kernel.registry.get(status.agent_id) {
+                                if entry.state == AgentState::Crashed {
+                                    let _ = kernel
+                                        .registry
+                                        .set_state(status.agent_id, AgentState::Terminated);
+                                    warn!(
+                                        agent = %status.name,
+                                        attempts = failures,
+                                        "Agent exhausted all recovery attempts — marked Terminated. Manual restart required."
+                                    );
+                                    // Publish event for notification channels
+                                    let event = Event::new(
+                                        status.agent_id,
+                                        EventTarget::System,
+                                        EventPayload::System(SystemEvent::HealthCheckFailed {
+                                            agent_id: status.agent_id,
+                                            unresponsive_secs: status.inactive_secs as u64,
+                                        }),
+                                    );
+                                    kernel.event_bus.publish(event).await;
+                                }
+                            }
+                            continue;
+                        }
+
+                        // Check cooldown
+                        if !recovery_tracker
+                            .can_attempt(status.agent_id, config.recovery_cooldown_secs)
+                        {
+                            debug!(
+                                agent = %status.name,
+                                "Recovery cooldown active, skipping"
+                            );
+                            continue;
+                        }
+
+                        // Attempt recovery: reset state to Running
+                        let attempt = recovery_tracker.record_attempt(status.agent_id);
+                        info!(
+                            agent = %status.name,
+                            attempt = attempt,
+                            max = config.max_recovery_attempts,
+                            "Auto-recovering crashed agent (attempt {}/{})",
+                            attempt,
+                            config.max_recovery_attempts
+                        );
+                        let _ = kernel
+                            .registry
+                            .set_state(status.agent_id, AgentState::Running);
+
+                        // Publish recovery event
+                        let event = Event::new(
+                            status.agent_id,
+                            EventTarget::System,
+                            EventPayload::System(SystemEvent::HealthCheckFailed {
+                                agent_id: status.agent_id,
+                                unresponsive_secs: 0, // 0 signals recovery attempt
+                            }),
+                        );
+                        kernel.event_bus.publish(event).await;
+                        continue;
+                    }
+
+                    // --- Running agent that recovered successfully ---
+                    // If agent is Running and was previously in recovery, clear the tracker
+                    if status.state == AgentState::Running
+                        && !status.unresponsive
+                        && recovery_tracker.failure_count(status.agent_id) > 0
+                    {
+                        info!(
+                            agent = %status.name,
+                            "Agent recovered successfully — resetting recovery tracker"
+                        );
+                        recovery_tracker.reset(status.agent_id);
+                    }
+
+                    // --- Unresponsive Running agent ---
+                    if status.unresponsive && status.state == AgentState::Running {
+                        // Mark as Crashed so next cycle triggers recovery
+                        let _ = kernel
+                            .registry
+                            .set_state(status.agent_id, AgentState::Crashed);
+                        warn!(
+                            agent = %status.name,
+                            inactive_secs = status.inactive_secs,
+                            "Unresponsive Running agent marked as Crashed for recovery"
+                        );
+
                         let event = Event::new(
                             status.agent_id,
                             EventTarget::System,
@@ -4498,40 +4613,6 @@ impl OpenFangKernel {
             .unwrap_or(&self.config.default_model);
         let default_provider = &effective_default.provider;
 
-        // Multi-account Claude Code rotation
-        if agent_provider == "claude-code" && !self.config.claude_code_accounts.is_empty() {
-            use openfang_runtime::drivers::claude_code::ClaudeCodeDriver;
-            use openfang_runtime::drivers::fallback::FallbackDriver;
-
-            let accounts = &self.config.claude_code_accounts;
-            if accounts.len() == 1 {
-                let acc = &accounts[0];
-                return Ok(Arc::new(ClaudeCodeDriver::new_with_config(
-                    acc.cli_path.clone(),
-                    Some(acc.config_dir.clone()),
-                    acc.skip_permissions,
-                )));
-            }
-
-            let chain: Vec<(Arc<dyn openfang_runtime::llm_driver::LlmDriver>, String)> = accounts
-                .iter()
-                .map(|acc| {
-                    let label = acc.label.clone().unwrap_or_else(|| acc.config_dir.clone());
-                    tracing::info!(account = %label, "Registered Claude Code account for rotation");
-                    let driver: Arc<dyn openfang_runtime::llm_driver::LlmDriver> =
-                        Arc::new(ClaudeCodeDriver::new_with_config(
-                            acc.cli_path.clone(),
-                            Some(acc.config_dir.clone()),
-                            acc.skip_permissions,
-                        ));
-                    (driver, String::new())
-                })
-                .collect();
-
-            return Ok(Arc::new(FallbackDriver::with_models(chain)));
-        }
-
-        // If agent uses same provider as kernel default and has no custom overrides, reuse
         let has_custom_key = manifest.model.api_key_env.is_some();
         let has_custom_url = manifest.model.base_url.is_some();
 
@@ -4628,7 +4709,7 @@ impl OpenFangKernel {
                     skip_permissions: true,
                 };
                 match drivers::create_driver(&config) {
-                    Ok(d) => chain.push((d, fb.model.clone())),
+                    Ok(d) => chain.push((d, strip_provider_prefix(&fb.model, &fb.provider))),
                     Err(e) => {
                         warn!("Fallback driver '{}' failed to init: {e}", fb.provider);
                     }
@@ -4663,6 +4744,17 @@ impl OpenFangKernel {
                 },
                 McpTransportEntry::Sse { url } => McpTransport::Sse { url: url.clone() },
             };
+
+            // Resolve env vars from vault/dotenv before passing to MCP subprocess.
+            // The MCP spawn calls env_clear() then re-adds only whitelisted vars
+            // from std::env — so we must ensure they're in std::env first.
+            for var_name in &server_config.env {
+                if std::env::var(var_name).is_err() {
+                    if let Some(val) = self.resolve_credential(var_name) {
+                        std::env::set_var(var_name, &val);
+                    }
+                }
+            }
 
             let mcp_config = McpServerConfig {
                 name: server_config.name.clone(),
@@ -6078,7 +6170,20 @@ impl KernelHandle for OpenFangKernel {
             openfang_user: None,
         };
 
-        let content = openfang_channels::types::ChannelContent::Text(message.to_string());
+        let formatted = if channel == "wecom" {
+            let output_format = self
+                .config
+                .channels
+                .wecom
+                .as_ref()
+                .and_then(|c| c.overrides.output_format)
+                .unwrap_or(OutputFormat::PlainText);
+            openfang_channels::formatter::format_for_wecom(message, output_format)
+        } else {
+            message.to_string()
+        };
+
+        let content = openfang_channels::types::ChannelContent::Text(formatted);
 
         if let Some(tid) = thread_id {
             adapter
@@ -6527,5 +6632,39 @@ mod tests {
         assert!(!caps
             .iter()
             .any(|c| matches!(c, Capability::ToolInvoke(name) if name == "shell_exec")));
+    }
+
+    #[test]
+    fn test_hand_activation_does_not_seed_runtime_tool_filters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-kernel-hand-test");
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+
+        let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+        let instance = kernel
+            .activate_hand("browser", HashMap::new())
+            .expect("browser hand should activate");
+        let agent_id = instance.agent_id.expect("browser hand agent id");
+        let entry = kernel
+            .registry
+            .get(agent_id)
+            .expect("browser hand agent entry");
+
+        assert!(
+            entry.manifest.tool_allowlist.is_empty(),
+            "hand activation should leave the runtime tool allowlist empty so skill/MCP tools remain visible"
+        );
+        assert!(
+            entry.manifest.tool_blocklist.is_empty(),
+            "hand activation should not set a runtime blocklist by default"
+        );
+
+        kernel.shutdown();
     }
 }

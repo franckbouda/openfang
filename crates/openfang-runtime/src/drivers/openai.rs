@@ -12,12 +12,17 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
+/// Azure OpenAI API version query parameter.
+const AZURE_API_VERSION: &str = "2024-10-21";
+
 /// OpenAI-compatible API driver.
 pub struct OpenAIDriver {
     api_key: Zeroizing<String>,
     base_url: String,
     client: reqwest::Client,
     extra_headers: Vec<(String, String)>,
+    /// When true, uses Azure OpenAI URL format and `api-key` header.
+    azure_mode: bool,
 }
 
 impl OpenAIDriver {
@@ -31,18 +36,73 @@ impl OpenAIDriver {
                 .build()
                 .unwrap_or_default(),
             extra_headers: Vec::new(),
+            azure_mode: false,
+        }
+    }
+
+    /// Create a driver configured for Azure OpenAI.
+    ///
+    /// Azure uses a deployment-based URL scheme and `api-key` header instead of
+    /// `Authorization: Bearer`.  The `base_url` should be the deployments root,
+    /// e.g. `https://{resource}.openai.azure.com/openai/deployments`.
+    pub fn new_azure(api_key: String, base_url: String) -> Self {
+        Self {
+            api_key: Zeroizing::new(api_key),
+            base_url,
+            client: reqwest::Client::builder()
+                .user_agent(crate::USER_AGENT)
+                .build()
+                .unwrap_or_default(),
+            extra_headers: Vec::new(),
+            azure_mode: true,
         }
     }
 
     /// True if this provider is Moonshot/Kimi and requires reasoning_content on assistant messages with tool_calls.
-    fn kimi_needs_reasoning_content(&self, model: &str) -> bool {
-        self.base_url.contains("moonshot") || model.to_lowercase().contains("kimi")
+    fn needs_reasoning_content(&self, model: &str) -> bool {
+        self.base_url.contains("moonshot")
+            || model.to_lowercase().contains("kimi")
+            || model.to_lowercase().contains("reasoner")
     }
 
     /// Create a driver with additional HTTP headers (e.g. for Copilot IDE auth).
     pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
         self.extra_headers = headers;
         self
+    }
+
+    /// Build the chat completions URL for the given model.
+    ///
+    /// Standard OpenAI: `{base_url}/chat/completions`
+    /// Azure OpenAI:    `{base_url}/{model}/chat/completions?api-version=2024-10-21`
+    fn chat_url(&self, model: &str) -> String {
+        if self.azure_mode {
+            format!(
+                "{}/{}/chat/completions?api-version={}",
+                self.base_url.trim_end_matches('/'),
+                model,
+                AZURE_API_VERSION,
+            )
+        } else {
+            format!("{}/chat/completions", self.base_url)
+        }
+    }
+
+    /// Apply authentication headers to the request builder.
+    ///
+    /// Standard: `Authorization: Bearer {key}`
+    /// Azure:    `api-key: {key}`
+    fn apply_auth(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.api_key.as_str().is_empty() {
+            return builder;
+        }
+        if self.azure_mode {
+            builder = builder.header("api-key", self.api_key.as_str());
+        } else {
+            builder =
+                builder.header("authorization", format!("Bearer {}", self.api_key.as_str()));
+        }
+        builder
     }
 }
 
@@ -93,9 +153,14 @@ fn rejects_temperature(model: &str) -> bool {
     m.starts_with("o1")
         || m.starts_with("o3")
         || m.starts_with("o4")
-        // GPT-5-mini is a reasoning model that rejects temperature
+        // GPT-5 nano/mini are reasoning models that reject temperature
         || m.starts_with("gpt-5-mini")
+        || m.starts_with("gpt-5-nano")
         || m.starts_with("gpt5-mini")
+        || m.starts_with("gpt5-nano")
+        // DeepSeek-R1 reasoning models
+        || m.contains("deepseek-r1")
+        || m.contains("reasoner")
         // Catch any model explicitly tagged as "reasoning"
         || m.contains("-reasoning")
 }
@@ -297,6 +362,7 @@ impl LlmDriver for OpenAIDriver {
                 (Role::Assistant, MessageContent::Blocks(blocks)) => {
                     let mut text_parts = Vec::new();
                     let mut tool_calls = Vec::new();
+                    let mut reasoning_text = String::new();
                     for block in blocks {
                         match block {
                             ContentBlock::Text { text, .. } => text_parts.push(text.clone()),
@@ -312,17 +378,16 @@ impl LlmDriver for OpenAIDriver {
                                     },
                                 });
                             }
-                            ContentBlock::Thinking { .. } => {}
+                            ContentBlock::Thinking { thinking, .. } => {
+                                reasoning_text = thinking.clone();
+                            }
                             _ => {}
                         }
                     }
                     let has_tool_calls = !tool_calls.is_empty();
+                    let needs_reasoning = self.needs_reasoning_content(&request.model);
                     oai_messages.push(OaiMessage {
                         role: "assistant".to_string(),
-                        // ZHIPU (GLM) rejects assistant messages where content is
-                        // null or omitted when tool_calls are present (error 1214).
-                        // Always send an empty string so every OpenAI-compat
-                        // provider gets a valid payload.
                         content: if text_parts.is_empty() {
                             if has_tool_calls {
                                 Some(OaiMessageContent::Text(String::new()))
@@ -338,10 +403,12 @@ impl LlmDriver for OpenAIDriver {
                             Some(tool_calls)
                         },
                         tool_call_id: None,
-                        reasoning_content: if has_tool_calls
-                            && self.kimi_needs_reasoning_content(&request.model)
-                        {
-                            Some(String::new())
+                        reasoning_content: if needs_reasoning {
+                            Some(if reasoning_text.is_empty() {
+                                String::new()
+                            } else {
+                                reasoning_text
+                            })
                         } else {
                             None
                         },
@@ -383,7 +450,7 @@ impl LlmDriver for OpenAIDriver {
             messages: oai_messages,
             max_tokens: mt,
             max_completion_tokens: mct,
-            temperature: if self.kimi_needs_reasoning_content(&request.model) {
+            temperature: if self.needs_reasoning_content(&request.model) {
                 // Kimi with thinking disabled uses fixed 0.6 for multi-turn compatibility.
                 Some(0.6)
             } else if temperature_must_be_one(&request.model) {
@@ -397,7 +464,7 @@ impl LlmDriver for OpenAIDriver {
             tool_choice,
             stream: false,
             stream_options: None,
-            thinking: if self.kimi_needs_reasoning_content(&request.model) {
+            thinking: if self.needs_reasoning_content(&request.model) {
                 Some(serde_json::json!({"type": "disabled"}))
             } else {
                 None
@@ -406,19 +473,16 @@ impl LlmDriver for OpenAIDriver {
 
         let max_retries = 3;
         for attempt in 0..=max_retries {
-            let url = format!("{}/chat/completions", self.base_url);
+            let url = self.chat_url(&request.model);
             debug!(url = %url, attempt, "Sending OpenAI API request");
 
-            let mut req_builder = self
+            let req_builder = self
                 .client
                 .post(&url)
                 .header("content-type", "application/json")
                 .json(&oai_request);
 
-            if !self.api_key.as_str().is_empty() {
-                req_builder = req_builder
-                    .header("authorization", format!("Bearer {}", self.api_key.as_str()));
-            }
+            let mut req_builder = self.apply_auth(req_builder);
             for (k, v) in &self.extra_headers {
                 req_builder = req_builder.header(k, v);
             }
@@ -442,10 +506,7 @@ impl LlmDriver for OpenAIDriver {
             }
 
             if !resp.status().is_success() {
-                let body = resp
-                    .text()
-                    .await
-                    .unwrap_or_else(|e| format!("(failed to read response: {e})"));
+                let body = resp.text().await.unwrap_or_default();
 
                 // Groq "tool_use_failed": model generated tool call in XML format.
                 // Parse the failed_generation and convert to a proper tool call response.
@@ -621,13 +682,8 @@ impl LlmDriver for OpenAIDriver {
 
             if let Some(calls) = choice.message.tool_calls {
                 for call in calls {
-                    let input: serde_json::Value = serde_json::from_str(&call.function.arguments)
-                        .map_err(|e| {
-                        LlmError::Parse(format!(
-                            "Invalid tool arguments for '{}': {}",
-                            call.function.name, e
-                        ))
-                    })?;
+                    let input: serde_json::Value =
+                        serde_json::from_str(&call.function.arguments).unwrap_or_default();
                     content.push(ContentBlock::ToolUse {
                         id: call.id.clone(),
                         name: call.function.name.clone(),
@@ -762,6 +818,7 @@ impl LlmDriver for OpenAIDriver {
                 (Role::Assistant, MessageContent::Blocks(blocks)) => {
                     let mut text_parts = Vec::new();
                     let mut tool_calls_out = Vec::new();
+                    let mut reasoning_text = String::new();
                     for block in blocks {
                         match block {
                             ContentBlock::Text { text, .. } => text_parts.push(text.clone()),
@@ -777,11 +834,14 @@ impl LlmDriver for OpenAIDriver {
                                     },
                                 });
                             }
-                            ContentBlock::Thinking { .. } => {}
+                            ContentBlock::Thinking { thinking, .. } => {
+                                reasoning_text = thinking.clone();
+                            }
                             _ => {}
                         }
                     }
                     let has_tool_calls = !tool_calls_out.is_empty();
+                    let needs_reasoning = self.needs_reasoning_content(&request.model);
                     oai_messages.push(OaiMessage {
                         role: "assistant".to_string(),
                         content: if text_parts.is_empty() {
@@ -799,10 +859,12 @@ impl LlmDriver for OpenAIDriver {
                             Some(tool_calls_out)
                         },
                         tool_call_id: None,
-                        reasoning_content: if has_tool_calls
-                            && self.kimi_needs_reasoning_content(&request.model)
-                        {
-                            Some(String::new())
+                        reasoning_content: if needs_reasoning {
+                            Some(if reasoning_text.is_empty() {
+                                String::new()
+                            } else {
+                                reasoning_text
+                            })
                         } else {
                             None
                         },
@@ -844,7 +906,7 @@ impl LlmDriver for OpenAIDriver {
             messages: oai_messages,
             max_tokens: mt,
             max_completion_tokens: mct,
-            temperature: if self.kimi_needs_reasoning_content(&request.model) {
+            temperature: if self.needs_reasoning_content(&request.model) {
                 Some(0.6)
             } else if temperature_must_be_one(&request.model) {
                 Some(1.0)
@@ -857,7 +919,7 @@ impl LlmDriver for OpenAIDriver {
             tool_choice,
             stream: true,
             stream_options: Some(serde_json::json!({"include_usage": true})),
-            thinking: if self.kimi_needs_reasoning_content(&request.model) {
+            thinking: if self.needs_reasoning_content(&request.model) {
                 Some(serde_json::json!({"type": "disabled"}))
             } else {
                 None
@@ -867,19 +929,16 @@ impl LlmDriver for OpenAIDriver {
         // Retry loop for the initial HTTP request
         let max_retries = 3;
         for attempt in 0..=max_retries {
-            let url = format!("{}/chat/completions", self.base_url);
+            let url = self.chat_url(&request.model);
             debug!(url = %url, attempt, "Sending OpenAI streaming request");
 
-            let mut req_builder = self
+            let req_builder = self
                 .client
                 .post(&url)
                 .header("content-type", "application/json")
                 .json(&oai_request);
 
-            if !self.api_key.as_str().is_empty() {
-                req_builder = req_builder
-                    .header("authorization", format!("Bearer {}", self.api_key.as_str()));
-            }
+            let mut req_builder = self.apply_auth(req_builder);
             for (k, v) in &self.extra_headers {
                 req_builder = req_builder.header(k, v);
             }
@@ -903,10 +962,7 @@ impl LlmDriver for OpenAIDriver {
             }
 
             if !resp.status().is_success() {
-                let body = resp
-                    .text()
-                    .await
-                    .unwrap_or_else(|e| format!("(failed to read response: {e})"));
+                let body = resp.text().await.unwrap_or_default();
 
                 // Groq "tool_use_failed": parse and recover (streaming path)
                 if status == 400 && body.contains("tool_use_failed") {
@@ -1256,9 +1312,7 @@ impl LlmDriver for OpenAIDriver {
             }
 
             for (id, name, arguments) in &tool_accum {
-                let input: serde_json::Value = serde_json::from_str(arguments).map_err(|e| {
-                    LlmError::Parse(format!("Invalid tool arguments for '{}': {}", name, e))
-                })?;
+                let input: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
                 content.push(ContentBlock::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
@@ -1268,14 +1322,14 @@ impl LlmDriver for OpenAIDriver {
                 tool_calls.push(ToolCall {
                     id: id.clone(),
                     name: name.clone(),
-                    input: input.clone(),
+                    input,
                 });
 
                 let _ = tx
                     .send(StreamEvent::ToolUseEnd {
                         id: id.clone(),
                         name: name.clone(),
-                        input,
+                        input: serde_json::from_str(arguments).unwrap_or_default(),
                     })
                     .await;
             }
@@ -1463,10 +1517,8 @@ fn parse_groq_failed_tool_call(body: &str) -> Option<CompletionResponse> {
         };
 
         // Parse args as JSON Value
-        let args_value: serde_json::Value = serde_json::from_str(args).unwrap_or_else(|e| {
-            tracing::warn!("Failed to parse recovered Groq tool arguments: {e}");
-            serde_json::json!({})
-        });
+        let args_value: serde_json::Value =
+            serde_json::from_str(args).unwrap_or(serde_json::json!({}));
 
         tool_calls.push(ToolCall {
             id: format!("groq_recovered_{}", tool_calls.len()),
@@ -1721,5 +1773,61 @@ mod tests {
         let msg: OaiResponseMessage = serde_json::from_str(json).unwrap();
         assert!(msg.content.is_none());
         assert!(msg.reasoning_content.is_none());
+    }
+
+    // ── Azure OpenAI tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_azure_driver_creation() {
+        let driver = OpenAIDriver::new_azure(
+            "test-key".to_string(),
+            "https://myresource.openai.azure.com/openai/deployments".to_string(),
+        );
+        assert!(driver.azure_mode);
+    }
+
+    #[test]
+    fn test_standard_driver_not_azure() {
+        let driver = OpenAIDriver::new(
+            "test-key".to_string(),
+            "https://api.openai.com/v1".to_string(),
+        );
+        assert!(!driver.azure_mode);
+    }
+
+    #[test]
+    fn test_azure_chat_url() {
+        let driver = OpenAIDriver::new_azure(
+            "test-key".to_string(),
+            "https://myresource.openai.azure.com/openai/deployments".to_string(),
+        );
+        let url = driver.chat_url("my-gpt4o-deployment");
+        assert_eq!(
+            url,
+            "https://myresource.openai.azure.com/openai/deployments/my-gpt4o-deployment/chat/completions?api-version=2024-10-21"
+        );
+    }
+
+    #[test]
+    fn test_azure_chat_url_trailing_slash() {
+        let driver = OpenAIDriver::new_azure(
+            "test-key".to_string(),
+            "https://myresource.openai.azure.com/openai/deployments/".to_string(),
+        );
+        let url = driver.chat_url("gpt-4o");
+        assert_eq!(
+            url,
+            "https://myresource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21"
+        );
+    }
+
+    #[test]
+    fn test_standard_chat_url() {
+        let driver = OpenAIDriver::new(
+            "test-key".to_string(),
+            "https://api.openai.com/v1".to_string(),
+        );
+        let url = driver.chat_url("gpt-4o");
+        assert_eq!(url, "https://api.openai.com/v1/chat/completions");
     }
 }

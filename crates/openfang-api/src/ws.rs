@@ -439,6 +439,7 @@ async fn handle_text_message(
 
             // Resolve file attachments into image content blocks
             let mut has_images = false;
+            let mut ws_content_blocks: Option<Vec<openfang_types::message::ContentBlock>> = None;
             if let Some(attachments) = parsed["attachments"].as_array() {
                 let refs: Vec<crate::types::AttachmentRef> = attachments
                     .iter()
@@ -448,11 +449,7 @@ async fn handle_text_message(
                     let image_blocks = crate::routes::resolve_attachments(&refs);
                     if !image_blocks.is_empty() {
                         has_images = true;
-                        crate::routes::inject_attachments_into_session(
-                            &state.kernel,
-                            agent_id,
-                            image_blocks,
-                        );
+                        ws_content_blocks = Some(image_blocks);
                     }
                 }
             }
@@ -508,6 +505,7 @@ async fn handle_text_message(
                 Some(kernel_handle),
                 None,
                 None,
+                ws_content_blocks,
             ) {
                 Ok((mut rx, handle)) => {
                     // Forward stream events to WebSocket with debouncing.
@@ -647,14 +645,12 @@ async fn handle_text_message(
                         match handle.await {
                             Ok(Err(e)) => {
                                 warn!("Agent post-processing failed: {e}");
-                                let err_info = classify_streaming_error(&e);
+                                let user_msg = classify_streaming_error(&e);
                                 let _ = send_json(
                                     &sender_bg,
                                     &serde_json::json!({
                                         "type": "error",
-                                        "content": err_info.content,
-                                        "retryable": err_info.retryable,
-                                        "error_code": err_info.error_code,
+                                        "content": user_msg,
                                     }),
                                 )
                                 .await;
@@ -772,14 +768,12 @@ async fn handle_text_message(
                         }),
                     )
                     .await;
-                    let err_info = classify_streaming_error(&e);
+                    let user_msg = classify_streaming_error(&e);
                     let _ = send_json(
                         sender,
                         &serde_json::json!({
                             "type": "error",
-                            "content": err_info.content,
-                            "retryable": err_info.retryable,
-                            "error_code": err_info.error_code,
+                            "content": user_msg,
                         }),
                     )
                     .await;
@@ -1145,34 +1139,19 @@ fn sanitize_text(s: &str) -> String {
         .to_string()
 }
 
-/// Structured error classification result for WebSocket error messages.
-struct WsErrorInfo {
-    content: String,
-    retryable: bool,
-    error_code: &'static str,
-}
-
-/// Classify a streaming/setup error into a structured WS error message.
+/// Classify a streaming/setup error into a user-friendly message.
 ///
-/// Returns content, retryability flag, and error code for the client so it can
-/// display actionable feedback and decide whether to offer a retry button.
-fn classify_streaming_error(err: &openfang_kernel::error::KernelError) -> WsErrorInfo {
+/// Uses the proper LLM error classifier from `openfang_runtime::llm_errors`
+/// for comprehensive 20-provider coverage with actionable advice.
+fn classify_streaming_error(err: &openfang_kernel::error::KernelError) -> String {
     let inner = format!("{err}");
 
     // Check for agent-specific errors first (not LLM errors)
     if inner.contains("Agent not found") {
-        return WsErrorInfo {
-            content: "Agent not found. It may have been stopped or deleted.".to_string(),
-            retryable: false,
-            error_code: "agent_not_found",
-        };
+        return "Agent not found. It may have been stopped or deleted.".to_string();
     }
     if inner.contains("quota") || inner.contains("Quota") {
-        return WsErrorInfo {
-            content: "Token quota exceeded. Try /compact or /new to free up space.".to_string(),
-            retryable: false,
-            error_code: "quota_exceeded",
-        };
+        return "Token quota exceeded. Try /compact or /new to free up space.".to_string();
     }
 
     // Use the LLM error classifier for everything else
@@ -1183,66 +1162,44 @@ fn classify_streaming_error(err: &openfang_kernel::error::KernelError) -> WsErro
     // includes a redacted excerpt of the raw error (issue #493 fix), so we
     // use it as the base and only override for cases that need extra context.
     match classified.category {
-        llm_errors::LlmErrorCategory::ContextOverflow => WsErrorInfo {
-            content: "Context is full. Try /compact or /new.".to_string(),
-            retryable: false,
-            error_code: "context_overflow",
-        },
+        llm_errors::LlmErrorCategory::ContextOverflow => {
+            "Context is full. Try /compact or /new.".to_string()
+        }
         llm_errors::LlmErrorCategory::RateLimit => {
-            let content = if let Some(delay_ms) = classified.suggested_delay_ms {
+            if let Some(delay_ms) = classified.suggested_delay_ms {
                 let secs = (delay_ms / 1000).max(1);
                 format!("Rate limited. Wait ~{secs}s and try again.")
             } else {
                 "Rate limited. Wait a moment and try again.".to_string()
-            };
-            WsErrorInfo {
-                content,
-                retryable: true,
-                error_code: "rate_limit",
             }
         }
-        llm_errors::LlmErrorCategory::Billing => WsErrorInfo {
-            content: format!("Billing issue. {}", classified.sanitized_message),
-            retryable: false,
-            error_code: "billing",
-        },
-        llm_errors::LlmErrorCategory::Auth => WsErrorInfo {
+        llm_errors::LlmErrorCategory::Billing => {
+            format!("Billing issue. {}", classified.sanitized_message)
+        }
+        llm_errors::LlmErrorCategory::Auth => {
             // Show the actual error detail so users can diagnose (issue #493).
             // The sanitized_message already redacts secrets.
-            content: classified.sanitized_message.clone(),
-            retryable: false,
-            error_code: "auth",
-        },
+            classified.sanitized_message.clone()
+        }
         llm_errors::LlmErrorCategory::ModelNotFound => {
-            let content = if inner.contains("localhost:11434") || inner.contains("ollama") {
+            if inner.contains("localhost:11434") || inner.contains("ollama") {
                 "Model not found on Ollama. Run `ollama pull <model>` first. Use /model to see options.".to_string()
             } else {
                 format!(
                     "{}. Use /model to see options.",
                     classified.sanitized_message
                 )
-            };
-            WsErrorInfo {
-                content,
-                retryable: false,
-                error_code: "model_not_found",
             }
         }
-        llm_errors::LlmErrorCategory::Format => WsErrorInfo {
-            content: if inner.contains("Claude Code CLI") || inner.contains("claude auth") {
-                // Claude Code CLI errors have actionable messages — pass them through
+        llm_errors::LlmErrorCategory::Format => {
+            // Claude Code CLI errors have actionable messages — pass them through
+            if inner.contains("Claude Code CLI") || inner.contains("claude auth") {
                 classified.raw_message.clone()
             } else {
                 classified.sanitized_message.clone()
-            },
-            retryable: false,
-            error_code: "format",
-        },
-        _ => WsErrorInfo {
-            content: classified.sanitized_message,
-            retryable: true,
-            error_code: "network",
-        },
+            }
+        }
+        _ => classified.sanitized_message,
     }
 }
 

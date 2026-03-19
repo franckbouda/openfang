@@ -9,7 +9,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Handle to the running embedded server. Drop or call `shutdown()` to stop.
 pub struct ServerHandle {
@@ -17,8 +17,6 @@ pub struct ServerHandle {
     pub port: u16,
     /// The kernel instance (shared with the server).
     pub kernel: Arc<OpenFangKernel>,
-    /// Display key for vault (if newly generated).
-    pub vault_display_key: Option<String>,
     /// Send `true` to trigger graceful shutdown.
     shutdown_tx: watch::Sender<bool>,
     /// Join handle for the background server thread.
@@ -60,103 +58,16 @@ impl Drop for ServerHandle {
     }
 }
 
-/// Enrich the process PATH so subprocesses (e.g. `claude` CLI) can be found
-/// in GUI apps that inherit a minimal PATH from launchd.
-fn enrich_path() {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let mut extra: Vec<String> = Vec::new();
-
-    // User-local binaries (npm --prefix ~/.local, pipx, cargo, etc.)
-    if !home.is_empty() {
-        let candidates = [
-            format!("{home}/.local/bin"),
-            format!("{home}/.npm-global/bin"),
-            format!("{home}/.yarn/bin"),
-            format!("{home}/.cargo/bin"),
-        ];
-        for c in &candidates {
-            if std::path::Path::new(c).exists() {
-                extra.push(c.clone());
-            }
-        }
-
-        // NVM: add the latest installed node version's bin
-        let nvm_base = std::path::PathBuf::from(&home).join(".nvm/versions/node");
-        if let Ok(entries) = std::fs::read_dir(&nvm_base) {
-            let mut versions: Vec<_> = entries.flatten().collect();
-            versions.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
-            if let Some(latest) = versions.first() {
-                let bin = latest.path().join("bin");
-                if bin.exists() {
-                    extra.push(bin.to_string_lossy().to_string());
-                }
-            }
-        }
-    }
-
-    // System package managers
-    for p in &["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"] {
-        if std::path::Path::new(p).exists() {
-            extra.push(p.to_string());
-        }
-    }
-
-    if extra.is_empty() {
-        return;
-    }
-
-    let current = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", extra.join(":"), current);
-    openfang_types::set_env_var("PATH", &new_path);
-    info!("Enriched PATH with {} extra directories", extra.len());
-}
-
 /// Boot the kernel and start the embedded API server on a background thread.
 ///
 /// Binds to `127.0.0.1:0` on the calling thread so the port is known before
 /// any Tauri window is created. The actual axum server runs on a dedicated
 /// thread with its own tokio runtime.
 pub fn start_server() -> Result<ServerHandle, Box<dyn std::error::Error>> {
-    // Enrich PATH for GUI app context (launchd has minimal PATH)
-    enrich_path();
-
-    // Auto-initialize vault and migrate config.toml secrets
-    let home = openfang_kernel::config::openfang_home();
-    let vault_path = home.join("vault.enc");
-    let config_path = home.join("config.toml");
-    let mut vault_display_key: Option<String> = None;
-
-    if !vault_path.exists() {
-        let mut vault = openfang_extensions::vault::CredentialVault::new(vault_path.clone());
-        match vault.init_and_get_display_key() {
-            Ok(Some(key)) => {
-                info!("Vault created with new master key");
-                vault_display_key = Some(key.as_str().to_string());
-            }
-            Ok(None) => info!("Vault created (key from OS keyring)"),
-            Err(e) => warn!("Could not init vault: {e}"),
-        }
-    }
-
-    if vault_path.exists() && config_path.exists() {
-        let mut vault = openfang_extensions::vault::CredentialVault::new(vault_path.clone());
-        if vault.unlock().is_ok() {
-            match openfang_extensions::credentials::migrate_config_to_vault(
-                &config_path,
-                &mut vault,
-            ) {
-                Ok(migrated) if !migrated.is_empty() => {
-                    info!(
-                        "Migrated {} credential(s) from config.toml to vault: {}",
-                        migrated.len(),
-                        migrated.join(", ")
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => warn!("Migration config.toml→vault skipped: {e}"),
-            }
-        }
-    }
+    // Load .env and secrets.env into process environment (same as CLI).
+    // Without this, API keys stored in ~/.openfang/.env are invisible to
+    // the kernel's provider detection and credential resolver.
+    load_dotenv_files();
 
     // Boot kernel (sync — no tokio needed)
     let kernel = OpenFangKernel::boot(None)?;
@@ -193,7 +104,6 @@ pub fn start_server() -> Result<ServerHandle, Box<dyn std::error::Error>> {
     Ok(ServerHandle {
         port,
         kernel,
-        vault_display_key,
         shutdown_tx,
         server_thread: Some(server_thread),
         shutdown_initiated,
@@ -237,6 +147,47 @@ async fn run_embedded_server(
         let mut guard = state.bridge_manager.lock().await;
         if let Some(ref mut b) = *guard {
             b.stop().await;
+        }
+    }
+}
+
+/// Load ~/.openfang/.env and ~/.openfang/secrets.env into the process environment.
+/// System env vars take priority — existing vars are NOT overridden.
+fn load_dotenv_files() {
+    let home = if let Ok(h) = std::env::var("OPENFANG_HOME") {
+        std::path::PathBuf::from(h)
+    } else {
+        let user_home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_default();
+        if user_home.is_empty() {
+            return;
+        }
+        std::path::PathBuf::from(user_home).join(".openfang")
+    };
+
+    for filename in &[".env", "secrets.env"] {
+        let path = home.join(filename);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                if let Some((key, value)) = trimmed.split_once('=') {
+                    let key = key.trim();
+                    let mut value = value.trim().to_string();
+                    if ((value.starts_with('"') && value.ends_with('"'))
+                        || (value.starts_with('\'') && value.ends_with('\'')))
+                        && value.len() >= 2
+                    {
+                        value = value[1..value.len() - 1].to_string();
+                    }
+                    if !key.is_empty() && std::env::var(key).is_err() {
+                        std::env::set_var(key, &value);
+                    }
+                }
+            }
         }
     }
 }

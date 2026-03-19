@@ -5,11 +5,12 @@
 
 use openfang_types::model_catalog::{
     AuthStatus, ModelCatalogEntry, ModelTier, ProviderInfo, AI21_BASE_URL, ANTHROPIC_BASE_URL,
-    BEDROCK_BASE_URL, CEREBRAS_BASE_URL, CHUTES_BASE_URL, COHERE_BASE_URL, DEEPSEEK_BASE_URL,
-    FIREWORKS_BASE_URL, GEMINI_BASE_URL, GITHUB_COPILOT_BASE_URL, GROQ_BASE_URL,
-    HUGGINGFACE_BASE_URL, KIMI_CODING_BASE_URL, LEMONADE_BASE_URL, LMSTUDIO_BASE_URL,
-    MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, NVIDIA_NIM_BASE_URL, OLLAMA_BASE_URL,
-    OPENAI_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
+    AZURE_OPENAI_BASE_URL, BEDROCK_BASE_URL, CEREBRAS_BASE_URL, CHUTES_BASE_URL,
+    COHERE_BASE_URL, DEEPSEEK_BASE_URL, FIREWORKS_BASE_URL, GEMINI_BASE_URL,
+    GITHUB_COPILOT_BASE_URL, GROQ_BASE_URL, HUGGINGFACE_BASE_URL, KIMI_CODING_BASE_URL,
+    LEMONADE_BASE_URL, LMSTUDIO_BASE_URL, MINIMAX_BASE_URL, MISTRAL_BASE_URL,
+    MOONSHOT_BASE_URL, NVIDIA_NIM_BASE_URL, OLLAMA_BASE_URL, OPENAI_BASE_URL,
+    OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
     REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL, VLLM_BASE_URL,
     VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
     ZAI_CODING_BASE_URL, ZHIPU_BASE_URL, ZHIPU_CODING_BASE_URL,
@@ -752,6 +753,16 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             auth_status: AuthStatus::Missing,
             model_count: 0,
         },
+        // ── Azure OpenAI ───────────────────────────────────────────
+        ProviderInfo {
+            id: "azure".into(),
+            display_name: "Azure OpenAI".into(),
+            api_key_env: "AZURE_OPENAI_API_KEY".into(),
+            base_url: AZURE_OPENAI_BASE_URL.into(),
+            key_required: true,
+            auth_status: AuthStatus::Missing,
+            model_count: 0,
+        },
         // ── OpenAI Codex ────────────────────────────────────────────
         ProviderInfo {
             id: "codex".into(),
@@ -804,6 +815,7 @@ fn builtin_aliases() -> HashMap<String, String> {
         ("deepseek", "deepseek-chat"),
         ("llama", "llama-3.3-70b-versatile"),
         ("llama-70b", "llama-3.3-70b-versatile"),
+        ("mixtral", "mixtral-8x7b-32768"),
         ("mistral", "mistral-large-latest"),
         ("codestral", "codestral-latest"),
         // DeepSeek aliases
@@ -857,11 +869,6 @@ fn builtin_aliases() -> HashMap<String, String> {
         ("claude-code-opus", "claude-code/opus"),
         ("claude-code-sonnet", "claude-code/sonnet"),
         ("claude-code-haiku", "claude-code/haiku"),
-        // Groq safety/audio aliases
-        ("prompt-guard", "meta-llama/llama-prompt-guard-2-86m"),
-        ("whisper", "whisper-large-v3"),
-        ("whisper-v3", "whisper-large-v3"),
-        ("whisper-turbo", "whisper-large-v3-turbo"),
         // Qwen Code aliases
         ("qwen-code", "qwen-code/qwen3-coder"),
         ("qwen-coder", "qwen-code/qwen3-coder"),
@@ -1414,17 +1421,78 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec![],
         },
         // ══════════════════════════════════════════════════════════════
-        // Groq (8)
+        // Azure OpenAI (4)
+        // These represent common Azure deployment names. Users deploy models
+        // under their own deployment names, so these are illustrative defaults.
+        // ══════════════════════════════════════════════════════════════
+        ModelCatalogEntry {
+            id: "azure/gpt-4o".into(),
+            display_name: "GPT-4o (Azure)".into(),
+            provider: "azure".into(),
+            tier: ModelTier::Smart,
+            context_window: 128_000,
+            max_output_tokens: 16_384,
+            input_cost_per_m: 2.50,
+            output_cost_per_m: 10.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "azure/gpt-4o-mini".into(),
+            display_name: "GPT-4o Mini (Azure)".into(),
+            provider: "azure".into(),
+            tier: ModelTier::Fast,
+            context_window: 128_000,
+            max_output_tokens: 16_384,
+            input_cost_per_m: 0.15,
+            output_cost_per_m: 0.60,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "azure/gpt-4.1".into(),
+            display_name: "GPT-4.1 (Azure)".into(),
+            provider: "azure".into(),
+            tier: ModelTier::Frontier,
+            context_window: 1_047_576,
+            max_output_tokens: 32_768,
+            input_cost_per_m: 2.00,
+            output_cost_per_m: 8.00,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "azure/gpt-4.1-mini".into(),
+            display_name: "GPT-4.1 Mini (Azure)".into(),
+            provider: "azure".into(),
+            tier: ModelTier::Fast,
+            context_window: 1_047_576,
+            max_output_tokens: 32_768,
+            input_cost_per_m: 0.40,
+            output_cost_per_m: 1.60,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        // ══════════════════════════════════════════════════════════════
+        // Groq (11)
         // ══════════════════════════════════════════════════════════════
         ModelCatalogEntry {
             id: "llama-3.3-70b-versatile".into(),
             display_name: "Llama 3.3 70B".into(),
             provider: "groq".into(),
             tier: ModelTier::Balanced,
-            context_window: 131_072,
+            context_window: 128_000,
             max_output_tokens: 32_768,
-            input_cost_per_m: 0.59,
-            output_cost_per_m: 0.79,
+            input_cost_per_m: 0.059,
+            output_cost_per_m: 0.079,
             supports_tools: true,
             supports_vision: false,
             supports_streaming: true,
@@ -1435,8 +1503,8 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             display_name: "Llama 3.1 8B".into(),
             provider: "groq".into(),
             tier: ModelTier::Fast,
-            context_window: 131_072,
-            max_output_tokens: 131_072,
+            context_window: 128_000,
+            max_output_tokens: 8_192,
             input_cost_per_m: 0.05,
             output_cost_per_m: 0.08,
             supports_tools: true,
@@ -1445,28 +1513,98 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec![],
         },
         ModelCatalogEntry {
-            id: "openai/gpt-oss-120b".into(),
-            display_name: "GPT OSS 120B (Groq)".into(),
+            id: "llama-3.2-90b-vision-preview".into(),
+            display_name: "Llama 3.2 90B Vision".into(),
             provider: "groq".into(),
             tier: ModelTier::Smart,
-            context_window: 131_072,
-            max_output_tokens: 65_536,
-            input_cost_per_m: 0.15,
-            output_cost_per_m: 0.60,
+            context_window: 128_000,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.90,
+            output_cost_per_m: 0.90,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "llama-3.2-11b-vision-preview".into(),
+            display_name: "Llama 3.2 11B Vision".into(),
+            provider: "groq".into(),
+            tier: ModelTier::Balanced,
+            context_window: 128_000,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.18,
+            output_cost_per_m: 0.18,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "llama-3.2-3b-preview".into(),
+            display_name: "Llama 3.2 3B".into(),
+            provider: "groq".into(),
+            tier: ModelTier::Fast,
+            context_window: 128_000,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.06,
+            output_cost_per_m: 0.06,
             supports_tools: true,
             supports_vision: false,
             supports_streaming: true,
             aliases: vec![],
         },
         ModelCatalogEntry {
-            id: "openai/gpt-oss-20b".into(),
-            display_name: "GPT OSS 20B (Groq)".into(),
+            id: "llama-3.2-1b-preview".into(),
+            display_name: "Llama 3.2 1B".into(),
             provider: "groq".into(),
             tier: ModelTier::Fast,
-            context_window: 131_072,
-            max_output_tokens: 65_536,
-            input_cost_per_m: 0.075,
-            output_cost_per_m: 0.30,
+            context_window: 128_000,
+            max_output_tokens: 8_192,
+            input_cost_per_m: 0.04,
+            output_cost_per_m: 0.04,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "mixtral-8x7b-32768".into(),
+            display_name: "Mixtral 8x7B".into(),
+            provider: "groq".into(),
+            tier: ModelTier::Balanced,
+            context_window: 32_768,
+            max_output_tokens: 4_096,
+            input_cost_per_m: 0.024,
+            output_cost_per_m: 0.024,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec!["mixtral".into()],
+        },
+        ModelCatalogEntry {
+            id: "gemma2-9b-it".into(),
+            display_name: "Gemma 2 9B".into(),
+            provider: "groq".into(),
+            tier: ModelTier::Fast,
+            context_window: 8_192,
+            max_output_tokens: 4_096,
+            input_cost_per_m: 0.02,
+            output_cost_per_m: 0.02,
+            supports_tools: false,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "qwen-qwq-32b".into(),
+            display_name: "Qwen QWQ 32B".into(),
+            provider: "groq".into(),
+            tier: ModelTier::Balanced,
+            context_window: 128_000,
+            max_output_tokens: 16_384,
+            input_cost_per_m: 0.20,
+            output_cost_per_m: 0.20,
             supports_tools: true,
             supports_vision: false,
             supports_streaming: true,
@@ -1477,7 +1615,7 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             display_name: "Llama 4 Scout 17B".into(),
             provider: "groq".into(),
             tier: ModelTier::Balanced,
-            context_window: 131_072,
+            context_window: 128_000,
             max_output_tokens: 8_192,
             input_cost_per_m: 0.11,
             output_cost_per_m: 0.34,
@@ -1485,79 +1623,6 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_vision: true,
             supports_streaming: true,
             aliases: vec![],
-        },
-        ModelCatalogEntry {
-            id: "moonshotai/kimi-k2-instruct-0905".into(),
-            display_name: "Kimi K2 (Groq)".into(),
-            provider: "groq".into(),
-            tier: ModelTier::Smart,
-            context_window: 262_144,
-            max_output_tokens: 32_768,
-            input_cost_per_m: 1.00,
-            output_cost_per_m: 3.00,
-            supports_tools: true,
-            supports_vision: false,
-            supports_streaming: true,
-            aliases: vec![],
-        },
-        ModelCatalogEntry {
-            id: "qwen/qwen3-32b".into(),
-            display_name: "Qwen3 32B (Groq)".into(),
-            provider: "groq".into(),
-            tier: ModelTier::Balanced,
-            context_window: 131_072,
-            max_output_tokens: 32_768,
-            input_cost_per_m: 0.29,
-            output_cost_per_m: 0.59,
-            supports_tools: true,
-            supports_vision: false,
-            supports_streaming: true,
-            aliases: vec![],
-        },
-        ModelCatalogEntry {
-            id: "meta-llama/llama-prompt-guard-2-86m".into(),
-            display_name: "Llama Prompt Guard 2 86M (Groq)".into(),
-            provider: "groq".into(),
-            tier: ModelTier::Fast,
-            context_window: 512,
-            max_output_tokens: 512,
-            input_cost_per_m: 0.0,
-            output_cost_per_m: 0.0,
-            supports_tools: false,
-            supports_vision: false,
-            supports_streaming: false,
-            aliases: vec!["prompt-guard".into()],
-        },
-        // ══════════════════════════════════════════════════════════════
-        // Groq — Audio Transcription (2)
-        // ══════════════════════════════════════════════════════════════
-        ModelCatalogEntry {
-            id: "whisper-large-v3".into(),
-            display_name: "Whisper Large V3 (Groq)".into(),
-            provider: "groq".into(),
-            tier: ModelTier::Audio,
-            context_window: 0,
-            max_output_tokens: 0,
-            input_cost_per_m: 0.111,
-            output_cost_per_m: 0.0,
-            supports_tools: false,
-            supports_vision: false,
-            supports_streaming: true,
-            aliases: vec!["whisper".into(), "whisper-v3".into()],
-        },
-        ModelCatalogEntry {
-            id: "whisper-large-v3-turbo".into(),
-            display_name: "Whisper Large V3 Turbo (Groq)".into(),
-            provider: "groq".into(),
-            tier: ModelTier::Audio,
-            context_window: 0,
-            max_output_tokens: 0,
-            input_cost_per_m: 0.04,
-            output_cost_per_m: 0.0,
-            supports_tools: false,
-            supports_vision: false,
-            supports_streaming: true,
-            aliases: vec!["whisper-turbo".into()],
         },
         // ══════════════════════════════════════════════════════════════
         // OpenRouter (10) — pass-through models using real upstream IDs
@@ -3744,7 +3809,7 @@ mod tests {
     #[test]
     fn test_catalog_has_providers() {
         let catalog = ModelCatalog::new();
-        assert_eq!(catalog.list_providers().len(), 40);
+        assert_eq!(catalog.list_providers().len(), 41);
     }
 
     #[test]
@@ -4134,5 +4199,37 @@ mod tests {
         let catalog = ModelCatalog::new();
         let entry = catalog.find_model("qwen-code").unwrap();
         assert_eq!(entry.id, "qwen-code/qwen3-coder");
+    }
+
+    #[test]
+    fn test_azure_provider_in_catalog() {
+        let catalog = ModelCatalog::new();
+        let azure = catalog.get_provider("azure").unwrap();
+        assert_eq!(azure.display_name, "Azure OpenAI");
+        assert_eq!(azure.api_key_env, "AZURE_OPENAI_API_KEY");
+        assert!(azure.key_required);
+        assert!(azure.base_url.is_empty()); // user must supply their own
+    }
+
+    #[test]
+    fn test_azure_models() {
+        let catalog = ModelCatalog::new();
+        let models = catalog.models_by_provider("azure");
+        assert_eq!(models.len(), 4);
+        assert!(models.iter().any(|m| m.id == "azure/gpt-4o"));
+        assert!(models.iter().any(|m| m.id == "azure/gpt-4o-mini"));
+        assert!(models.iter().any(|m| m.id == "azure/gpt-4.1"));
+        assert!(models.iter().any(|m| m.id == "azure/gpt-4.1-mini"));
+    }
+
+    #[test]
+    fn test_azure_model_lookup() {
+        let catalog = ModelCatalog::new();
+        let entry = catalog.find_model("azure/gpt-4o").unwrap();
+        assert_eq!(entry.provider, "azure");
+        assert_eq!(entry.display_name, "GPT-4o (Azure)");
+        assert_eq!(entry.tier, ModelTier::Smart);
+        assert!(entry.supports_tools);
+        assert!(entry.supports_vision);
     }
 }

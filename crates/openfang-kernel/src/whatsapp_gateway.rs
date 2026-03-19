@@ -162,9 +162,9 @@ pub async fn start_whatsapp_gateway(kernel: &Arc<super::kernel::OpenFangKernel>)
         .to_string();
 
     // Auto-set the env var so the rest of the system finds the gateway
-    openfang_types::set_env_var(
+    std::env::set_var(
         "WHATSAPP_WEB_GATEWAY_URL",
-        &format!("http://127.0.0.1:{port}"),
+        format!("http://127.0.0.1:{port}"),
     );
     info!("WHATSAPP_WEB_GATEWAY_URL set to http://127.0.0.1:{port}");
 
