@@ -156,13 +156,14 @@ pub async fn auth(
             .and_then(|v| v.to_str().ok())
     });
 
-    // SECURITY: Use constant-time comparison to prevent timing attacks.
+    // SECURITY: Compare via SHA-256 hashes to prevent timing and length-leakage attacks.
+    // Hashing both values produces equal-length digests, avoiding early exits on length mismatch.
     let header_auth = api_token.map(|token| {
+        use sha2::{Digest, Sha256};
         use subtle::ConstantTimeEq;
-        if token.len() != api_key.len() {
-            return false;
-        }
-        token.as_bytes().ct_eq(api_key.as_bytes()).into()
+        let expected = Sha256::digest(api_key.as_bytes());
+        let provided = Sha256::digest(token.as_bytes());
+        expected.ct_eq(&provided).into()
     });
 
     // Also check ?token= query parameter (for EventSource/SSE clients that
@@ -172,13 +173,13 @@ pub async fn auth(
         .query()
         .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")));
 
-    // SECURITY: Use constant-time comparison to prevent timing attacks.
+    // SECURITY: Compare via SHA-256 hashes (same as header auth).
     let query_auth = query_token.map(|token| {
+        use sha2::{Digest, Sha256};
         use subtle::ConstantTimeEq;
-        if token.len() != api_key.len() {
-            return false;
-        }
-        token.as_bytes().ct_eq(api_key.as_bytes()).into()
+        let expected = Sha256::digest(api_key.as_bytes());
+        let provided = Sha256::digest(token.as_bytes());
+        expected.ct_eq(&provided).into()
     });
 
     // Accept if either auth method matches
@@ -236,10 +237,12 @@ pub async fn security_headers(request: Request<Body>, next: Next) -> Response<Bo
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
     headers.insert("x-frame-options", "DENY".parse().unwrap());
     headers.insert("x-xss-protection", "1; mode=block".parse().unwrap());
-    // All JS/CSS is bundled inline — only external resource is Google Fonts.
+    // CSP: Alpine.js requires 'unsafe-eval' for x-data expressions.
+    // 'unsafe-inline' is kept for inline <script> blocks (compiled into binary).
+    // connect-src restricted to secure WebSocket only (issue #81).
     headers.insert(
         "content-security-policy",
-        "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* ws://127.0.0.1:* wss://localhost:* wss://127.0.0.1:*; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'"
+        "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' wss://localhost:* wss://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'"
             .parse()
             .unwrap(),
     );

@@ -7,6 +7,7 @@ use dashmap::DashMap;
 use openfang_types::agent::UserId;
 use openfang_types::config::UserConfig;
 use openfang_types::error::{OpenFangError, OpenFangResult};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use tracing::info;
 
@@ -100,6 +101,8 @@ pub struct AuthManager {
     users: DashMap<UserId, UserIdentity>,
     /// Channel binding index: "channel_type:platform_id" → UserId.
     channel_index: DashMap<String, UserId>,
+    /// API key hash index: SHA-256(api_key) → UserId for per-user API auth.
+    api_key_index: DashMap<String, UserId>,
 }
 
 impl AuthManager {
@@ -108,6 +111,7 @@ impl AuthManager {
         let manager = Self {
             users: DashMap::new(),
             channel_index: DashMap::new(),
+            api_key_index: DashMap::new(),
         };
 
         for config in user_configs {
@@ -125,6 +129,13 @@ impl AuthManager {
             for (channel_type, platform_id) in &config.channel_bindings {
                 let key = format!("{channel_type}:{platform_id}");
                 manager.channel_index.insert(key, user_id);
+            }
+
+            // Index API key hash for per-user API authentication (issue #62)
+            if let Some(ref hash) = config.api_key_hash {
+                if !hash.is_empty() {
+                    manager.api_key_index.insert(hash.clone(), user_id);
+                }
             }
 
             info!(
@@ -170,6 +181,17 @@ impl AuthManager {
                 identity.name, identity.role, action, required
             )))
         }
+    }
+
+    /// Verify an API key against stored per-user api_key_hash values.
+    ///
+    /// Hashes the provided key with SHA-256 and looks up the result in the
+    /// api_key_index. Returns the matching user identity if found.
+    pub fn verify_api_key(&self, provided_key: &str) -> Option<UserIdentity> {
+        let provided_hash = hex::encode(Sha256::digest(provided_key.as_bytes()));
+        self.api_key_index
+            .get(&provided_hash)
+            .and_then(|user_id| self.get_user(*user_id.value()))
     }
 
     /// Check if RBAC is configured (any users registered).
