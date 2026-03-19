@@ -88,6 +88,8 @@ impl ClaudeCodeDriver {
             cli_path: resolve_claude_path(&raw),
             config_dir: None,
             skip_permissions: true,
+            active_pids: Arc::new(DashMap::new()),
+            message_timeout_secs: DEFAULT_MESSAGE_TIMEOUT_SECS,
         }
     }
 
