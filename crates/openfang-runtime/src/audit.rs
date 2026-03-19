@@ -78,13 +78,19 @@ fn compute_entry_hash(
     hex::encode(hasher.finalize())
 }
 
+/// Internal state protected by a single mutex to prevent TOCTOU races
+/// between entries and tip updates.
+struct AuditState {
+    entries: Vec<AuditEntry>,
+    tip: String,
+}
+
 /// An append-only, tamper-evident audit log using a Merkle hash chain.
 ///
-/// Thread-safe — all access is serialised through internal mutexes.
+/// Thread-safe — all access is serialised through a single internal mutex.
 /// Optionally backed by SQLite for persistence across daemon restarts.
 pub struct AuditLog {
-    entries: Mutex<Vec<AuditEntry>>,
-    tip: Mutex<String>,
+    state: Mutex<AuditState>,
     /// Optional database connection for persistent storage.
     db: Option<Arc<Mutex<Connection>>>,
 }
@@ -95,8 +101,10 @@ impl AuditLog {
     /// The initial tip hash is 64 zero characters (the "genesis" sentinel).
     pub fn new() -> Self {
         Self {
-            entries: Mutex::new(Vec::new()),
-            tip: Mutex::new("0".repeat(64)),
+            state: Mutex::new(AuditState {
+                entries: Vec::new(),
+                tip: "0".repeat(64),
+            }),
             db: None,
         }
     }
@@ -155,8 +163,7 @@ impl AuditLog {
 
         let count = entries.len();
         let log = Self {
-            entries: Mutex::new(entries),
-            tip: Mutex::new(tip),
+            state: Mutex::new(AuditState { entries, tip }),
             db: Some(conn),
         };
 
@@ -189,11 +196,13 @@ impl AuditLog {
         let outcome = outcome.into();
         let timestamp = Utc::now().to_rfc3339();
 
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let mut tip = self.tip.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+            tracing::error!("Audit log mutex poisoned — recovering data but integrity may be compromised");
+            e.into_inner()
+        });
 
-        let seq = entries.len() as u64;
-        let prev_hash = tip.clone();
+        let seq = state.entries.len() as u64;
+        let prev_hash = state.tip.clone();
 
         let hash = compute_entry_hash(
             seq, &timestamp, &agent_id, &action, &detail, &outcome, &prev_hash,
@@ -229,8 +238,8 @@ impl AuditLog {
             }
         }
 
-        entries.push(entry);
-        *tip = hash.clone();
+        state.entries.push(entry);
+        state.tip = hash.clone();
         hash
     }
 
@@ -239,7 +248,8 @@ impl AuditLog {
     /// Returns `Ok(())` if the chain is intact, or `Err(msg)` describing
     /// the first inconsistency found.
     pub fn verify_integrity(&self) -> Result<(), String> {
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let entries = &state.entries;
         let mut expected_prev = "0".repeat(64);
 
         for entry in entries.iter() {
@@ -276,27 +286,28 @@ impl AuditLog {
     /// Returns the current tip hash (the hash of the most recent entry,
     /// or the genesis sentinel if the log is empty).
     pub fn tip_hash(&self) -> String {
-        self.tip.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).tip.clone()
     }
 
     /// Returns the number of entries in the log.
     pub fn len(&self) -> usize {
-        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).entries.len()
     }
 
     /// Returns whether the log is empty.
     pub fn is_empty(&self) -> bool {
-        self.entries
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .entries
             .is_empty()
     }
 
     /// Returns up to the most recent `n` entries (cloned).
     pub fn recent(&self, n: usize) -> Vec<AuditEntry> {
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let start = entries.len().saturating_sub(n);
-        entries[start..].to_vec()
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let start = state.entries.len().saturating_sub(n);
+        state.entries[start..].to_vec()
     }
 }
 
@@ -348,8 +359,8 @@ mod tests {
 
         // Tamper with an entry
         {
-            let mut entries = log.entries.lock().unwrap();
-            entries[1].detail = "echo hello".to_string(); // change the detail
+            let mut state = log.state.lock().unwrap();
+            state.entries[1].detail = "echo hello".to_string(); // change the detail
         }
 
         let result = log.verify_integrity();
